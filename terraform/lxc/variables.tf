@@ -100,9 +100,9 @@ variable "swap_mb" {
 # ── Disk ─────────────────────────────────────────────────────────────────────
 
 variable "disk_size" {
-  description = "Root filesystem size, e.g. '8G'."
-  type        = string
-  default     = "8G"
+  description = "Root filesystem size in GB."
+  type        = number
+  default     = 8
 }
 
 variable "datastore_id" {

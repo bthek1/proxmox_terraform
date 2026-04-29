@@ -1,4 +1,4 @@
-# terraform.tfvars.example
+ your Proxmox details to populate terraform.tfvars# terraform.tfvars.example
 # Copy to terraform.tfvars and fill in your values.
 # terraform.tfvars is gitignored — never commit real credentials.
 
@@ -20,7 +20,7 @@ os_type          = "ubuntu"
 cpu_cores    = 1
 memory_mb    = 512
 swap_mb      = 512
-disk_size    = "8G"
+disk_size    = 8
 datastore_id = "local-lvm"
 
 network_bridge = "vmbr0"
