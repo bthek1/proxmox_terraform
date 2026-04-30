@@ -8,6 +8,10 @@ resource "proxmox_virtual_environment_container" "lxc" {
 
   unprivileged = var.unprivileged
 
+  features {
+    nesting = var.nesting
+  }
+
   started       = var.start_on_create
   start_on_boot = var.start_on_boot
 

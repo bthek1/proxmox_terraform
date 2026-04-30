@@ -163,3 +163,9 @@ variable "unprivileged" {
   type        = bool
   default     = true
 }
+
+variable "nesting" {
+  description = "Enable nesting support (required for systemd 255+ inside the container)."
+  type        = bool
+  default     = false
+}
