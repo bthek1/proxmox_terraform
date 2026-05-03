@@ -57,3 +57,24 @@ resource "proxmox_virtual_environment_container" "lxc" {
     type             = var.os_type
   }
 }
+
+resource "null_resource" "extra_user" {
+  count = var.extra_username != "" ? 1 : 0
+
+  depends_on = [proxmox_virtual_environment_container.lxc]
+
+  connection {
+    type        = "ssh"
+    host        = replace(var.network_ip, "/24", "")
+    user        = "root"
+    private_key = file("~/.ssh/id_ed25519")
+    timeout     = "120s"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "id ${var.extra_username} >/dev/null 2>&1 || useradd -m -s /bin/bash ${var.extra_username}",
+      "printf '%s:%s' '${var.extra_username}' '${var.extra_user_password}' | chpasswd",
+    ]
+  }
+}

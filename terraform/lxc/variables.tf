@@ -140,6 +140,19 @@ variable "root_password" {
   default     = ""
 }
 
+variable "extra_username" {
+  description = "Additional non-root user to create inside the container."
+  type        = string
+  default     = ""
+}
+
+variable "extra_user_password" {
+  description = "Password for the extra non-root user."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "ssh_public_keys" {
   description = "SSH public keys to inject into root's authorized_keys."
   type        = string

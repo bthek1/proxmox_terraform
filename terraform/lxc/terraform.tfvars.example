@@ -10,7 +10,7 @@ proxmox_username = "root@pam"
 proxmox_node = "pve"
 
 container_id       = 100
-container_hostname = "my-container"
+container_hostname = "terraCT"
 container_tags     = ["terraform", "lxc"]
 
 # Ubuntu 24.04 LXC template — download via Proxmox UI or pveam first
