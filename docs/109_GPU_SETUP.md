@@ -6,10 +6,10 @@ This document is the single reference for the NVIDIA GPU setup on Proxmox node `
 
 ## Hardware
 
-| Slot     | GPU                        | PCI address |
-| -------- | -------------------------- | ----------- |
-| Primary  | NVIDIA RTX 3060 LHR        | `01:00.0`   |
-| Secondary| NVIDIA GTX 1660 SUPER      | `08:00.0`   |
+| Slot      | GPU                   | PCI address |
+| --------- | --------------------- | ----------- |
+| Primary   | NVIDIA RTX 3060 LHR   | `01:00.0`   |
+| Secondary | NVIDIA GTX 1660 SUPER | `08:00.0`   |
 
 Both GPUs are physically installed in the Proxmox host. They are **not** passed through to VMs via VFIO/PCIe passthrough. Instead, they are shared with LXC containers via **device node passthrough**.
 
@@ -125,6 +125,7 @@ ssh -t proxmox "sudo bash /tmp/nvidia_fix.sh"
 ```
 
 What it does:
+
 1. Installs kernel headers for the running kernel if missing
 2. Auto-detects the registered DKMS nvidia version
 3. Runs `dkms install nvidia/<ver> -k <kernel>`
@@ -145,6 +146,7 @@ ssh -t proxmox "sudo bash /tmp/nvidia_upgrade.sh"
 ```
 
 What it does:
+
 1. Removes the old DKMS entry
 2. Downloads the new `.run` installer
 3. Installs with `--dkms --no-drm --silent`
@@ -189,13 +191,162 @@ nvidia-smi
 **Root cause:** A `pve-kernel` upgrade moves the host to a kernel version that the installed NVIDIA driver does not support. DKMS compilation fails → no modules load → no device nodes → LXC 107 cannot start.
 
 **Symptom check:**
+
 ```bash
 lsmod | grep nvidia   # shows only i2c_nvidia_gpu, no nvidia module
 dkms status           # shows nvidia as "build failed" or missing for running kernel
 ```
 
 **Fix:**
+
 - If the driver version is compatible, run `nvidia_fix.sh` (DKMS rebuild).
 - If the driver version is too old for the kernel, run `nvidia_upgrade.sh` with an updated `DRIVER_VER`.
 
 See [LXC_107_NVIDIA_MODESET_ERROR.md](LXC_107_NVIDIA_MODESET_ERROR.md) for the full diagnosis history.
+
+---
+
+## VM 109 — PCIe GPU Passthrough (VFIO)
+
+VM 109 runs Ubuntu 24.04 with the GTX 1660 SUPER passed through via VFIO (IOMMU group 24, ACS override). This section documents known issues specific to that setup.
+
+### Issue: GDM Login Crash — "no screens found"
+
+**Symptom:** GDM shows the login screen. After entering the password the session fails and GDM returns to the login screen. Keyboard and mouse stop responding.
+
+**Root cause:** GDM's greeter runs in its own X server session and holds an exclusive lock on the GPU. When the user logs in, a second X server is spawned for the user session. Without KMS support the NVIDIA driver cannot hand the GPU between X servers, causing:
+
+```
+(EE) systemd-logind: failed to take device /dev/dri/card1: Device or resource busy
+(EE) no screens found
+```
+
+The crashed session releases its input devices, leaving keyboard and mouse unresponsive until GDM re-grabs them (which it fails to do cleanly).
+
+**Fix — enable NVIDIA KMS in the guest:**
+
+1. Edit `/etc/default/grub` inside VM 109:
+   ```
+   GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=on nvidia-drm.modeset=1"
+   ```
+2. Create `/etc/modprobe.d/nvidia-kms.conf`:
+   ```
+   options nvidia-drm modeset=1
+   ```
+3. Rebuild GRUB and initramfs:
+   ```bash
+   sudo update-grub
+   sudo update-initramfs -u -k all
+   sudo reboot
+   ```
+
+With `nvidia-drm.modeset=1` the NVIDIA driver registers a KMS device, allowing logind to properly transfer GPU ownership between sessions.
+
+---
+
+### Issue: QEMU Fails to Start — Missing USB Host Devices
+
+**Symptom:** After a VM reboot or host restart, VM 109 shows `status: running` in Proxmox but no QEMU process exists. The display is blank and SSH is unreachable.
+
+**Root cause:** QEMU hard-fails at startup if **any** `usb-host` device configured in the VM is not physically connected to the Proxmox host at that moment. The task log shows `TASK OK` (Proxmox side succeeded) but QEMU exits immediately with no surviving process.
+
+Diagnose with:
+
+```bash
+# Check which USB devices the VM requires
+sudo qm config 109 | grep usb
+
+# Check which are actually present
+lsusb
+
+# Compare — any missing device will kill QEMU on start
+```
+
+**Fix:** Remove any `usb-host` entries whose device is not currently plugged in:
+
+```bash
+# Example — remove specific slots
+sudo qm stop 109 --skiplock 1
+sudo qm set 109 --delete usb0,usb2,usb3,usb6,usb7,usb8,usb10,usb12
+sudo qm start 109
+```
+
+Re-add a device once it is physically connected:
+
+```bash
+# While VM is stopped or running (hot-plug)
+sudo qm set 109 --usb0 host=248a:8479
+```
+
+**Prevention:** Only add USB passthrough entries for devices that are permanently attached to the Proxmox host. Temporary or occasionally-connected devices should be hot-plugged via the Proxmox web UI (`Hardware → Add → USB Device`) rather than stored in the VM config.
+
+---
+
+### Issue: GDM Login Crash — "Failed to acquire modesetting permission"
+
+**Symptom:** After applying `nvidia-drm.modeset=1` (which fixes the original "Device or resource busy" error), GDM still fails to log in. The login screen appears correctly. After entering the password the session crashes and GDM returns to the login screen with keyboard/mouse unresponsive.
+
+**Error in `/home/proxmox-ml5/.local/share/xorg/Xorg.1.log` (session :1, the user session):**
+
+```
+(EE) systemd-logind: failed to take device /dev/dri/card1: Device or resource busy
+(EE) NVIDIA(GPU-0): Failed to acquire modesetting permission.
+(EE) NVIDIA(0): Failing initialization of X screen
+(EE) Screen(s) found, but none have a usable configuration.
+(EE) no screens found
+```
+
+Note: the NVIDIA driver successfully detects the GPU and enumerates outputs (DFP-0 through DFP-6 visible in log), but cannot acquire modesetting permission.
+
+**Root cause:** Ubuntu 24.04 GDM defaults to a Wayland compositor for the greeter session (`gdm-wayland-session`). The Wayland compositor acquires an **exclusive DRM master** lock on `/dev/dri/card1`. When the user logs in, GDM spawns a separate X server for the user session (session :1). That X server calls into `systemd-logind` to take the DRM device — but `logind` refuses because the Wayland compositor still holds DRM master. The NVIDIA driver therefore cannot acquire modesetting permission.
+
+This is distinct from the original error: `modeset=1` allowed the driver to load and enumerate outputs, but the DRM master contention is now the blocking issue.
+
+**Fix applied 2026-05-17 — four changes required:**
+
+Three separate problems had to be solved in sequence. `WaylandEnable=false` alone was not sufficient.
+
+**1. Disable GDM Wayland compositor** — `/etc/gdm3/custom.conf`:
+
+```ini
+[daemon]
+WaylandEnable=false
+```
+
+Uncommenting the existing commented-out line. Then `sudo systemctl restart gdm3`.
+
+**Why:** With Wayland disabled, GDM switches to an X11 greeter. However, this exposed two further problems (below).
+
+**2. Create explicit Xorg BusID config** — `/etc/X11/xorg.conf.d/10-nvidia.conf`:
+
+```
+Section "Device"
+    Identifier "nvidia"
+    Driver "nvidia"
+    BusID "PCI:1:0:0"
+    Option "AllowEmptyInitialConfiguration"
+EndSection
+```
+
+**Why:** In this GPU passthrough VM, the NVIDIA GPU is at `/dev/dri/card1` (no integrated graphics, so `card0` does not exist). Xorg's auto-detection only tries `card0` via the modesetting driver. Without an explicit BusID config, Xorg finds no devices and exits. The BusID forces Xorg to directly target the NVIDIA GPU at PCI:1:0:0 without needing to enumerate DRM devices first.
+
+**3. Add `gdm` user to `video` group:**
+
+```bash
+sudo usermod -aG video gdm
+```
+
+**Why:** `/dev/dri/card1` is owned by `root:video` with mode 660. The `gdm` user needs video group membership for Xorg to open the device during driver enumeration.
+
+**4. Update `/etc/X11/Xwrapper.config`:**
+
+```ini
+allowed_users=anybody
+needs_root_rights=yes
+```
+
+**Why:** Ubuntu's Xorg wrapper (`xserver-xorg-legacy`) defaults to `allowed_users=console`, meaning only users who own a VT (virtual terminal) can start Xorg with root rights. The GDM greeter runs as the `gdm` user in a `gdm-launch-environment` session (not a VT-owning session), so `VT_ACTIVATE` was failing with `Operation not permitted`. Setting `needs_root_rights=yes` allows the Xorg server to run as root and perform VT operations. `allowed_users=anybody` is required alongside it to permit the `gdm` user to invoke the wrapper.
+
+**Result:** GDM greeter X server starts on `seat0 tty1`, displays login screen on all connected monitors (3× 4K displays detected). Login screen is accessible.
+
+**Status:** Fixed and confirmed 2026-05-17. GDM session `c24` running at `seat0 tty1`.

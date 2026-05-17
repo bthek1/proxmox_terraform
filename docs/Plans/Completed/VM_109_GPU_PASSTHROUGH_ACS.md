@@ -1,6 +1,6 @@
 # Plan: GPU Passthrough to VM 109 via ACS Override
 
-**Status**: Not started
+**Status**: ✅ Complete (2026-05-17)
 **Prerequisite**: Host is stable, GPU (`07:00.x`) bound to `nvidia`, VM 109 running at `192.168.2.20`.
 
 ## Summary
@@ -32,7 +32,7 @@ for the full failure history and root cause analysis.
 
 ## Phase 1: Enable ACS Override and Split IOMMU Group 14
 
-**Status**: Not started
+**Status**: ✅ Complete (2026-05-17)
 
 **Goal**: Add `pcie_acs_override=downstream,multifunction` to the kernel cmdline so the
 GPU gets its own IOMMU group, isolated from the host NIC and SATA.
@@ -42,7 +42,7 @@ GPU gets its own IOMMU group, isolated from the host NIC and SATA.
 
 ### Deliverables
 
-- [ ] **1.1 — Add ACS override to GRUB**
+- [x] **1.1 — Add ACS override to GRUB**
 
   ```bash
   ssh proxmox
@@ -55,14 +55,14 @@ GPU gets its own IOMMU group, isolated from the host NIC and SATA.
   GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_iommu=on iommu=pt video=efifb:off pcie_acs_override=downstream,multifunction"
   ```
 
-- [ ] **1.2 — Apply and reboot**
+- [x] **1.2 — Apply and reboot**
 
   ```bash
   sudo update-grub
   sudo reboot
   ```
 
-- [ ] **1.3 — Verify GPU is in its own isolated IOMMU group**
+- [x] **1.3 — Verify GPU is in its own isolated IOMMU group**
 
   ```bash
   # After reboot, SSH back in
@@ -80,10 +80,10 @@ GPU gets its own IOMMU group, isolated from the host NIC and SATA.
 
 ### Verification
 
-- [ ] GPU (`07:00.x`) is in its own IOMMU group, not shared with `08:00.0`
-- [ ] Host NIC (`08:00.0`) is in a separate IOMMU group
-- [ ] Host SSH/WebUI reachable after reboot
-- [ ] `lspci -k -s 07:00.0` still shows `nvidia` (good — VFIO not yet configured)
+- [x] GPU (`07:00.x`) is in its own IOMMU group, not shared with `08:00.0`
+- [x] Host NIC (`08:00.0`) is in a separate IOMMU group
+- [x] Host SSH/WebUI reachable after reboot
+- [x] `lspci -k -s 07:00.0` still shows `nvidia` (good — VFIO not yet configured)
 
 ### Stability Criteria
 
@@ -91,13 +91,22 @@ Host boots cleanly with ACS override; GPU in isolated IOMMU group; network intac
 
 ### Notes
 
-_Record the new IOMMU group number for the GPU after ACS override._
+ACS override split all of Group 14 into individual groups:
+
+- Group 24: `07:00.0` GTX 1660 SUPER VGA
+- Group 25: `07:00.1` GTX Audio
+- Group 26: `07:00.2` GTX USB
+- Group 27: `07:00.3` GTX USB-C
+- Group 28: `08:00.0` Realtek NIC
+- Group 29: `09:00.0` WiFi
+- Group 30: `0b:00.0` USB controller
+- Group 31: `0c:00.0` SATA controller
 
 ---
 
 ## Phase 2: Bind GTX 1660 SUPER to vfio-pci
 
-**Status**: Not started
+**Status**: ✅ Complete (2026-05-17)
 **Prerequisite**: Phase 1 complete — GPU verified in isolated IOMMU group.
 
 **Goal**: Configure the host to hand the GPU to VFIO at boot instead of loading the
@@ -111,7 +120,7 @@ _Record the new IOMMU group number for the GPU after ACS override._
 
 ### Deliverables
 
-- [ ] **2.1 — Set vfio-pci IDs**
+- [x] **2.1 — Set vfio-pci IDs**
 
   ```bash
   sudo bash -c 'cat > /etc/modprobe.d/vfio.conf << EOF
@@ -119,7 +128,7 @@ _Record the new IOMMU group number for the GPU after ACS override._
   EOF'
   ```
 
-- [ ] **2.2 — Add softdep to prevent nvidia from binding first**
+- [x] **2.2 — Add softdep to prevent nvidia from binding first**
 
   ```bash
   sudo bash -c 'cat > /etc/modprobe.d/vfio-nvidia-softdep.conf << EOF
@@ -131,7 +140,7 @@ _Record the new IOMMU group number for the GPU after ACS override._
   EOF'
   ```
 
-- [ ] **2.3 — Load VFIO modules early in initramfs**
+- [x] **2.3 — Load VFIO modules early in initramfs**
 
   ```bash
   sudo bash -c 'cat >> /etc/initramfs-tools/modules << EOF
@@ -142,14 +151,14 @@ _Record the new IOMMU group number for the GPU after ACS override._
   EOF'
   ```
 
-- [ ] **2.4 — Rebuild initramfs and reboot**
+- [x] **2.4 — Rebuild initramfs and reboot**
 
   ```bash
   sudo update-initramfs -u -k all
   sudo reboot
   ```
 
-- [ ] **2.5 — Verify GPU is bound to vfio-pci**
+- [x] **2.5 — Verify GPU is bound to vfio-pci**
 
   ```bash
   ssh proxmox
@@ -170,11 +179,11 @@ _Record the new IOMMU group number for the GPU after ACS override._
 
 ### Verification
 
-- [ ] `lspci -k -s 07:00.0` → `Kernel driver in use: vfio-pci`
-- [ ] `lspci -k -s 07:00.1` → `Kernel driver in use: vfio-pci`
-- [ ] `lspci -k -s 07:00.2` → `Kernel driver in use: vfio-pci`
-- [ ] `lspci -k -s 07:00.3` → `Kernel driver in use: vfio-pci`
-- [ ] Host NIC still up, SSH/WebUI reachable
+- [x] `lspci -k -s 07:00.0` → `Kernel driver in use: vfio-pci`
+- [x] `lspci -k -s 07:00.1` → `Kernel driver in use: vfio-pci`
+- [ ] `lspci -k -s 07:00.2` → `Kernel driver in use: vfio-pci` ⚠️ still `xhci_hcd` — isolated group, OK for VGA-only passthrough
+- [ ] `lspci -k -s 07:00.3` → `Kernel driver in use: vfio-pci` ⚠️ still `nvidia-gpu` — isolated group, OK for VGA-only passthrough
+- [x] Host NIC still up, SSH/WebUI reachable
 
 ### Stability Criteria
 
@@ -182,11 +191,13 @@ All four GPU functions bound to `vfio-pci` after clean boot; host remains fully 
 
 ### Notes
 
+`07:00.0` (VGA) and `07:00.1` (Audio) correctly bound to `vfio-pci`. Functions `07:00.2` and `07:00.3` remain on `xhci_hcd`/`nvidia-gpu` — softdep does not cover those drivers. Since each function is now in its own IOMMU group (ACS), this is safe to proceed: only `07:00.0` will be passed to the VM.
+
 ---
 
 ## Phase 3: Configure VM 109 with PCIe Passthrough
 
-**Status**: Not started
+**Status**: ✅ Complete (2026-05-17)
 **Prerequisite**: Phase 2 complete — GPU bound to vfio-pci.
 
 **Goal**: Add the GTX 1660 SUPER as a PCIe passthrough device to VM 109, start the VM,
@@ -194,14 +205,14 @@ and confirm the GPU is visible inside the guest.
 
 ### Deliverables
 
-- [ ] **3.1 — Stop VM 109**
+- [x] **3.1 — Stop VM 109**
 
   ```bash
   ssh proxmox
   sudo qm stop 109
   ```
 
-- [ ] **3.2 — Set VM 109 PCIe passthrough config**
+- [x] **3.2 — Set VM 109 PCIe passthrough config**
 
   ```bash
   # Add GPU as primary display PCIe device
@@ -226,7 +237,7 @@ and confirm the GPU is visible inside the guest.
   > Only pass `07:00.0` (VGA function). The audio/USB functions can be added later if
   > needed — starting with just the display function reduces risk.
 
-- [ ] **3.3 — Start VM 109 and watch for host stability**
+- [x] **3.3 — Start VM 109 and watch for host stability**
 
   > ⚠️ This is the critical test. Keep an eye on host SSH in a separate terminal.
 
@@ -241,7 +252,7 @@ and confirm the GPU is visible inside the guest.
   If the host network survives, ACS override worked. If the host goes down again, the GPU
   is still in a shared IOMMU group — do NOT retry without fixing the grouping.
 
-- [ ] **3.4 — Verify GPU visible in guest**
+- [x] **3.4 — Verify GPU visible in guest**
 
   ```bash
   # Linux guest (VM 109)
@@ -252,11 +263,11 @@ and confirm the GPU is visible inside the guest.
 
 ### Verification
 
-- [ ] `qm start 109` succeeds without host network loss
-- [ ] `qm status 109` → `running`
-- [ ] GPU visible inside VM 109 (`lspci` or Device Manager)
-- [ ] Host SSH/WebUI reachable during and after VM start
-- [ ] `lspci -k -s 07:00.0` on host still shows `vfio-pci` (not reclaimed)
+- [x] `qm start 109` succeeds without host network loss
+- [x] `qm status 109` → `running`
+- [x] GPU visible inside VM 109 (`lspci` or Device Manager)
+- [x] Host SSH/WebUI reachable during and after VM start
+- [x] `lspci -k -s 07:00.0` on host still shows `vfio-pci` (not reclaimed)
 
 ### Stability Criteria
 
@@ -264,11 +275,13 @@ VM 109 running with GPU passthrough; host network unaffected; GPU owned by guest
 
 ### Notes
 
+VM 109 was already stopped. Config applied: `hostpci0: 0000:07:00.0,pcie=1,x-vga=1`, `vga: none`. Host NIC (`eno1`) remained `UP` throughout. GPU visible in guest as `01:00.0`.
+
 ---
 
 ## Phase 4: Guest Driver and Display Verification
 
-**Status**: Not started
+**Status**: ✅ Complete (2026-05-17)
 **Prerequisite**: Phase 3 complete — VM 109 running, GPU visible in guest.
 
 **Goal**: Install drivers in the guest and confirm a working display on the GTX 1660 SUPER
@@ -276,7 +289,7 @@ output port.
 
 ### Deliverables
 
-- [ ] **4.1 — Install NVIDIA drivers inside VM 109** (if not already present)
+- [x] **4.1 — Install NVIDIA drivers inside VM 109** (if not already present)
 
   Linux guest:
 
@@ -288,7 +301,7 @@ output port.
 
   Windows guest: Download and install from [nvidia.com](https://www.nvidia.com/Download/index.aspx).
 
-- [ ] **4.2 — Hide KVM from GPU (Windows only, to avoid Code 43)**
+- [x] **4.2 — Hide KVM from GPU (Windows only, to avoid Code 43)**
 
   If VM 109 is Windows and NVIDIA reports Code 43 error, add to VM 109 config:
 
@@ -296,12 +309,12 @@ output port.
   sudo qm set 109 --cpu "host,hidden=1"
   ```
 
-- [ ] **4.3 — Connect display cable to GTX 1660 SUPER port on host**
+- [x] **4.3 — Connect display cable to GTX 1660 SUPER port on host**
 
   Switch the monitor cable from its current port to the GTX 1660 SUPER port.
   Confirm display output appears.
 
-- [ ] **4.4 — Run `nvidia-smi` inside VM 109**
+- [x] **4.4 — Run `nvidia-smi` inside VM 109**
   ```bash
   nvidia-smi
   # Expected: shows GTX 1660 SUPER, no errors
@@ -309,16 +322,18 @@ output port.
 
 ### Verification
 
-- [ ] `nvidia-smi` inside guest shows GTX 1660 SUPER
-- [ ] No Code 43 (Windows) / no NVRM errors (Linux)
-- [ ] Display output confirmed on GTX 1660 SUPER port
-- [ ] Host `lspci -k -s 07:00.0` still shows `vfio-pci`
+- [x] `nvidia-smi` inside guest shows GTX 1660 SUPER
+- [x] No Code 43 (Windows) / no NVRM errors (Linux)
+- [x] Display output confirmed on GTX 1660 SUPER port
+- [x] Host `lspci -k -s 07:00.0` still shows `vfio-pci`
 
 ### Stability Criteria
 
 GPU fully functional inside guest with driver; display output confirmed.
 
 ### Notes
+
+Driver `580.142` already installed. `nvidia-smi` shows GTX 1660 SUPER at 49°C, 0% util idle, 18MiB/6144MiB VRAM in use. Xorg and GNOME Shell running on the GPU. Linux kernel `6.17.0-23-generic` (Ubuntu 24.04).
 
 ---
 
