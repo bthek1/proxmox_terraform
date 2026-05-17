@@ -9,7 +9,7 @@
 - Host: Proxmox `bthek1` at `192.168.2.70` (SSH alias: `proxmox`)
 - VM 109: Ubuntu 24.04, kernel `6.17.0-29-generic`, IP `192.168.2.20` (SSH alias: `proxmox_main`)
 - GPU: GTX 1660 SUPER at `PCI:1:0:0`, `/dev/dri/card1` (no integrated GPU, no `card0`)
-- NVIDIA driver: `580.142` (open kernel module), CUDA 13.0
+- NVIDIA driver: `580.142` → upgraded to `595.71.05` (open kernel module, DKMS) on 2026-05-17; CUDA 13.2
 - Current state: X11 greeter + X11 session working after fix applied 2026-05-17
 
 **Goal**: Replace the X11 greeter + X11 user session with a Wayland greeter + Wayland user session (GNOME on Wayland via Mutter), then remove the X11-specific workarounds that are no longer needed.

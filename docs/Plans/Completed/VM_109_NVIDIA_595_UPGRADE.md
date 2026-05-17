@@ -1,6 +1,6 @@
 # VM 109 — Upgrade NVIDIA Driver to 595.71.05
 
-**Status**: 🔄 In Progress
+**Status**: ✅ Completed (2026-05-17)
 
 **Problem**: VM 109 currently runs NVIDIA driver `580.142` (open kernel module). Upgrading to `595.71.05` brings bug fixes, improved Wayland/GBM support, and aligns the guest driver with the Proxmox host target version.
 
@@ -21,7 +21,7 @@
 
 ## Phase 1: Pre-flight Checks
 
-**Status**: Not started
+**Status**: ✅ Done
 
 **Goal**: Confirm current driver version, kernel, and Wayland state before making any changes.
 
@@ -51,7 +51,7 @@ ssh proxmox_main 'df -h /'
 
 ## Phase 2: Download Driver Installer
 
-**Status**: Not started
+**Status**: ✅ Done (file was already present from prior download)
 
 **Goal**: Download the `595.71.05` `.run` installer to VM 109 and verify its integrity.
 
@@ -80,7 +80,7 @@ ssh proxmox_main "chmod +x /tmp/${DRIVER_FILE} && ls -lh /tmp/${DRIVER_FILE}"
 
 ## Phase 3: Install Driver
 
-**Status**: Not started
+**Status**: ✅ Done
 
 **Goal**: Remove the old driver DKMS entry and install `595.71.05` in DKMS mode.
 
@@ -122,7 +122,7 @@ ssh proxmox_main 'dkms status'
 
 ## Phase 4: Verify Driver and Wayland
 
-**Status**: Not started
+**Status**: ✅ Done
 
 **Goal**: Reboot VM 109, confirm the new driver is loaded, and verify the Wayland session is still functional.
 
@@ -157,7 +157,7 @@ ssh proxmox_main 'loginctl show-session $(loginctl list-sessions --no-legend | a
 
 ## Phase 5: Cleanup
 
-**Status**: Not started
+**Status**: ✅ Done
 
 **Goal**: Remove installer file and record the completed upgrade.
 
