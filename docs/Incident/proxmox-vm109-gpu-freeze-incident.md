@@ -1,27 +1,205 @@
 # Proxmox VM 109 ("Main") — GPU Freeze Incident & Fix
 
-**Date investigated:** 2026-06-08 / 2026-06-09
+**Date investigated:** 2026-06-08 / 2026-06-09, **recurred 2026-06-10**
 **Machine:** VM 109 "Main" (`proxmox_main`, hostname `proxmox-ml5`, 192.168.2.20)
-**Status:** Fixed and verified — running known-good kernel 6.17.0-29 with RTD3 disabled.
+**Status:** RE-OPENED — froze again on the "known-good" kernel 6.17.0-29 with RTD3
+already disabled, **at only ~3.2 GB / 6 GB VRAM**. Not the kernel, and NOT VRAM
+exhaustion, and NOT a refresh-rate mismatch (all three outputs are identical
+3840x2160@60). Leading cause: a GNOME-Wayland + NVIDIA + multi-monitor compositor /
+page-flip stall. **Per-pipe probe (2026-06-10) localized the first-to-freeze output to
+DP-3 (crtc-2)** — a DisplayPort monitor (user-confirmed); DP-1 survives longest. Next:
+DP-3-targeted swap test + disable VRR in that monitor's OSD (Xorg ruled out by user).
 
-> SECURITY NOTE: this document references a sudo password. If this repo is pushed
-> to a remote, scrub the credential first or keep this file out of version control.
+> SECURITY NOTE: the guest sudo password is **not stored in this document**. It lives
+> in the gitignored `.env` at the repo root as `PROXMOX_MAIN_SUDO_PW` (see `.env.example`
+> for the key). Load it before running any command below with:
+> `set -a; source .env; set +a` — then commands reference `$PROXMOX_MAIN_SUDO_PW`.
 
 ---
 
-## TL;DR
+## TL;DR (revised 2026-06-10)
 
-The VM's graphics froze "after a while of use." There were **two distinct failure
-modes**, both introduced by **kernel `6.17.0-35`** (first booted ~Jun 8):
+The VM's graphics froze "after a while of use." Two distinct failure modes were seen:
 
 1. **Mode A — idle hard-freeze:** NVIDIA GPU runtime power management (RTD3) could
    not resume the passed-through GPU from deep sleep -> full system lockup every
-   ~1.5-2.5h, no logs. **Fixed by disabling RTD3.**
-2. **Mode B — VRAM/buffer exhaustion:** gnome-shell/mutter leaks VRAM over many
-   hours until the 6 GB GPU can't allocate a framebuffer -> display sticks (system
-   stays alive). **Addressed by rolling back to the known-good kernel 6.17.0-29.**
+   ~1.5-2.5h, no logs. **Fixed by disabling RTD3** (this fix holds).
+2. **Mode B — compositor / display freeze (the real recurring problem):** under
+   **GNOME on Wayland + NVIDIA proprietary + three monitors**, the display sticks
+   **one screen first, then the UI on the other two follows**. The system and even
+   gnome-shell's main loop stay alive (it keeps logging, SSH responsive) — only the
+   rendering/page-flip for the affected outputs stalls. This is a *display* freeze,
+   not a process death.
 
-Final state: booted on `6.17.0-29`, RTD3 disabled, bad kernel `6.17.0-35` held.
+**Two earlier theories were both WRONG — corrected here:**
+- **NOT the kernel.** On 2026-06-10 it froze again on the "known-good" kernel
+  `6.17.0-29` with RTD3 already off. `6.17.0-35` was never the cause of Mode B; each
+  kernel only *looked* fixed because the freeze takes hours to manifest.
+- **NOT VRAM exhaustion.** It froze at only **~3.2 GB / 6 GB** used — nowhere near
+  the ceiling, and with **zero** `gbm_surface_lock_front_buffer` / NVKMS-alloc /
+  Xid errors this boot. The 6 GB card is not running out of memory.
+
+**Leading hypothesis (medium confidence):** a mutter per-output frame-clock /
+NVIDIA page-flip **VSYNC desync**. mutter logged `Invalid sequence for VSYNC frame
+info` this boot — the fingerprint of that code path. When one output's page-flip
+completion stops being reported, that output's frame clock stalls and blocks the
+shared compositor, so the other monitors follow. NVIDIA + GNOME **Wayland** +
+multi-monitor is a known-fragile combination for exactly this.
+
+**Highest-leverage fix to test:** switch the session **GNOME Wayland -> Xorg (X11)**,
+which does not use mutter's per-output Wayland frame clock and is far more stable
+with the NVIDIA proprietary driver on multi-monitor. Easily reversible at the login
+screen. (Secondary: Firefox is independently crash-looping — repeated `libxul.so`
+segfaults — which may add compositor stress; worth disabling its GPU accel too.)
+
+> **2026-06-10 user decision:** **staying on Wayland — Xorg is OFF the table.** So the
+> Xorg A/B (the cleanest way to *confirm* the freeze cause) won't be run. Within
+> Wayland we attack the page-flip path directly with NVIDIA frame-timing settings, and
+> separately fix the Firefox/AppArmor crash-loop. See the second 2026-06-10 update and
+> the reordered "Mitigations (Wayland-only)" below.
+
+---
+
+## Update — 2026-06-10 (recurrence on the "good" kernel)
+
+Symptom matched exactly: one screen froze, then UI elements on the other two screens
+began to stick. Live diagnostics at the time of the freeze:
+
+```
+uname -r                       -> 6.17.0-29-generic     (the "known-good" kernel)
+DynamicPowerManagement         -> 0                      (RTD3 still disabled)
+session type                   -> wayland (gdm-wayland)
+uptime                         -> ~7h
+nvidia-smi VRAM used           -> 3215-3423 / 6144 MiB   (NOT exhausted; ~52%)
+  gnome-shell                  -> 965 MiB   (elevated but stable; 3 monitors)
+  /usr/share/code ...gpu-process -> 1647 MiB (VS Code GPU process; ~15 Code procs)
+  firefox                      -> ~1.5 GB RSS
+gbm_surface_lock / NVKMS-alloc -> 0 this boot  (so NOT the old VRAM signature)
+Xid / NVRM                     -> 0 this boot
+gnome-shell                    -> STILL logging (search providers at 00:10) = alive
+firefox                        -> repeated libxul.so segfaults (23:11, 23:37) +
+                                  constant Web-Content respawns = independently unstable
+mutter                         -> "Invalid sequence for VSYNC frame info" (18:24)
+SSH                            -> fully responsive (display-only freeze)
+```
+
+Conclusions:
+- **Froze at ~3.2 GB VRAM** -> NOT memory exhaustion. The earlier "VRAM exhaustion"
+  write-up was wrong; corrected.
+- **On 6.17.0-29 with RTD3 off** -> NOT the kernel.
+- gnome-shell's process stays alive and logging through the freeze -> a render /
+  page-flip stall, not a crash or hang of the whole compositor process.
+- Best-supported cause: NVIDIA + GNOME-**Wayland** + **multi-monitor** frame-timing
+  stall (see "Leading hypothesis" in the TL;DR).
+
+(Unrelated noise found: `openclaw-gateway.service` crash-looping ~4100 times — not
+GPU-related, worth fixing separately.)
+
+---
+
+## Update — 2026-06-10 (second diagnostic session, ~00:37, freeze live)
+
+Symptom this time, in the user's words: **"one screen is frozen; the other two partly
+work and the mouse still moves on them."** Diagnosed live over SSH while frozen (VM up
+~7h, boot Jun 09 17:23). Run from the PVE host (`bthek1`, this repo's machine) — note
+the host is an **AMD Phoenix3 iGPU laptop with a single eDP panel**; the 3-monitor
+NVIDIA setup is the *guest* VM 109, so all diagnostics targeted `proxmox_main`.
+
+### Live measurements
+
+```
+session type                 -> Wayland (gdm-wayland, gnome-shell + Xwayland)   confirmed
+kernel / RTD3                -> 6.17.0-29-generic, DynamicPowerManagement: 0    (unchanged)
+nvidia-smi VRAM              -> 3201 / 6144 MiB (~52%)                          NOT exhausted
+gbm_surface_lock / NVKMS     -> 0 this boot                                     (matches Jun-10 sig)
+"Invalid sequence VSYNC"     -> 1 (Jun 09 18:24:55, ~6h before freeze)          the fingerprint
+clutter "should not be reached" -> 0
+Xid / NVRM                   -> 1 hit, but it is ONLY the boot banner
+                                "NVRM: loading NVIDIA ... Open Kernel Module" (17:23:53)
+                                => ZERO real Xid / GPU hardware errors
+gnome-shell process (3298)   -> state Ssl (interruptible SLEEP, blocked), 5.8% CPU, alive
+                                last log 00:10 (search-provider noise); not R(spin), not D(stuck I/O)
+firefox                      -> 17 hard libxul.so segfaults, 32 procs; storm peaked ~23:37
+apparmor DENIED (firefox)    -> 2294 mmap denials of libgmpopenh264.so this boot
+openclaw-gateway.service     -> still crash-looping every ~6s (unrelated)
+```
+
+### What these tests *prove* (and disprove)
+
+- **It is the page-flip / frame-clock stall, confirmed by process state.** gnome-shell
+  is in **`Ssl` (blocked sleep), not `R` and not `D`** — it is parked waiting on a
+  NVIDIA page-flip-completion event that never arrives, exactly the mutter per-output
+  frame-clock stall. SSH responsive throughout => display-only.
+- **NOT a GPU hardware fault.** The lone "NVRM" match is the **driver load banner**, not
+  an Xid. Zero real GPU errors.
+- **NOT VRAM** (3.2 GB / 6 GB, zero gbm/NVKMS alloc failures) and **NOT kernel/RTD3**
+  (6.17.0-29, RTD3 off) — re-confirms the Jun-10 corrections.
+
+### Two DISTINCT problems (do not conflate — earlier draft did)
+
+1. **The freeze itself (root cause):** NVIDIA proprietary driver stops reporting
+   page-flip completion to mutter on **one Wayland output** → that output's frame clock
+   blocks → the shared compositor starves the other two → they go partial/sticky. The
+   **mouse still moves** because the cursor rides a separate hardware plane and the input
+   thread is independent of the render/page-flip path. This is a **driver↔compositor
+   sync bug**, not memory/kernel/hardware.
+
+2. **Firefox crash-loop (separate, now root-caused):** Ubuntu's **enforced `firefox`
+   AppArmor profile forbids `mmap` of the OpenH264 GMP codec** Firefox downloaded into
+   the user profile (`~/.mozilla/firefox/<prof>/gmp-gmpopenh264/2.6.0/libgmpopenh264.so`)
+   → every H.264 content process segfaults at null and respawns → **2294 denials / boot**.
+   Firefox is the **mozillateam .deb** `151.0.3~mt1`; profile `firefox` is in **enforce**
+   mode and has `include if exists <local/firefox>` (so a local override is the clean fix).
+
+   **Honest caveat — correlation, not proven causation.** The respawn storm subsided
+   ~1h *before* the frozen sample, so Firefox is at most a **plausible aggravator**
+   (surface churn stressing the fragile page-flip path), **NOT the proven trigger** of
+   the freeze. An earlier note in this doc that called Firefox "the trigger" overstated
+   it; corrected here.
+
+### Which output stalls first — per-pipe probe (2026-06-10 ~00:50)
+
+Drilled into the *individual outputs* during the same live freeze, reading the kernel's
+DRM atomic state directly (`/sys/kernel/debug/dri/1/state`) since the NVIDIA closed
+driver hides EDID/VRR/link state from sysfs and `nvidia-settings` needs the (frozen)
+GUI. **Method:** sample each CRTC's scanned-out framebuffer ID over time — the pipe
+whose `fb=` stops advancing is the one that stopped flipping.
+
+**Output topology (all on the 1660 SUPER, guest `card1`):**
+
+| Output | Pipe | Mode | 15 s flip test | Verdict |
+|--------|------|------|----------------|---------|
+| **DP-1**     | crtc-0 | 3840x2160@60 | primary `fb` toggling 151↔153 | **alive** (last survivor) |
+| **DP-3**     | crtc-2 | 3840x2160@60 | primary `fb` not advancing      | **first to freeze** (user-confirmed) |
+| **HDMI-A-1** | crtc-1 | 3840x2160@60 | primary `fb` latched at 154     | stalled (followed) |
+| DP-2         | —      | disconnected | — | **free port available** |
+
+Findings this session:
+- **The first output to freeze is DP-3 (a DisplayPort monitor), confirmed by the user.**
+  My initial guess that the lone HDMI was the weak link was **WRONG** — the user's direct
+  observation ("the dp screen freezes first") overrides it. DP-1 is the pipe that keeps
+  compositing longest (it falls back to a **software cursor baked into its primary**,
+  which is why its `fb` keeps toggling while the hardware cursor plane is frozen).
+- **Refresh-rate mismatch is RULED OUT.** All three outputs are **identical
+  3840x2160@60** (pixel clock 593.41 MHz). The "set all monitors to the same refresh
+  rate" mitigation is therefore *already satisfied* — that lever is exhausted, not a fix.
+- **The hardware cursor plane was frozen too** (pinned to crtc-0 at a fixed position for
+  16 s of sampling), i.e. by this point the freeze had progressed past "mouse still moves
+  on two."
+- Since the mode is identical across all three, **what's special about DP-3 is the
+  monitor / cable / port itself** — most likely that monitor's adaptive-sync (VRR), or a
+  marginal DP link dropping the occasional flip-completion event. Neither is readable
+  remotely on the closed NVIDIA driver; both must be checked physically (OSD + swap test).
+
+**Reusable probe (run via `ssh proxmox_main bash -s < script` to dodge fish quoting):**
+```bash
+PW="$PROXMOX_MAIN_SUDO_PW"; echo "$PW" | sudo -S true 2>/dev/null   # from .env
+snap(){ sudo cat /sys/kernel/debug/dri/1/state 2>/dev/null | awk '
+  /^plane\[/{crtc="";fb=""} /crtc=crtc-/{crtc=$1} /^\tfb=/{fb=$1}
+  /allocated by/{ if(crtc!=""&&crtc!="crtc=(null)"){tag=($0~/gnome-shell/)?"PRIMARY":"cursor"; print crtc" "tag" "fb} }'; }
+for i in 1 2 3 4 5 6; do echo "--- t=$(((i-1)*3))s ---"; snap; [ $i -lt 6 ] && sleep 3; done
+# The CRTC whose PRIMARY fb never changes = the stalled/frozen output.
+```
 
 ---
 
@@ -34,7 +212,7 @@ Final state: booted on `6.17.0-29`, RTD3 disabled, bad kernel `6.17.0-35` held.
 | GPU | NVIDIA GTX 1660 SUPER (TU116, 6 GB), passed through: host `08:00.0` -> guest `01:00.0` |
 | Driver | NVIDIA `580.159.03` (open kernel module), unchanged since 2026-05-21 |
 | Desktop | GNOME on Wayland (gdm-wayland, gnome-shell, Xwayland) |
-| Sudo | password `3719`; both `ben` and `proxmox-ml5` have **non-passwordless** sudo |
+| Sudo | password in gitignored `.env` as `PROXMOX_MAIN_SUDO_PW`; both `ben` and `proxmox-ml5` have **non-passwordless** sudo |
 | Remote shell | **fish** — bash `var=$(...)` / `for` loops fail over ssh; wrap in `bash -c '...'` |
 
 Host also has an RTX 3060 (host's own display, `nvidia` driver) and an AMD Raphael
@@ -74,22 +252,29 @@ boot Jun 9 11:44 -> ...      (Mode B: display froze, system alive)
 - GPU runtime PM was enabled: `power/control = auto`, driver param
   `DynamicPowerManagement: 3`.
 
-### Mode B evidence (VRAM exhaustion)
+### Mode B evidence (compositor / display freeze)
 
-- Live, recurring every ~60s on the current boot:
+**Jun 9 occurrence (had a VRAM-pressure signature):**
+- Live, recurring every ~60s on that boot:
   ```
   gnome-shell: Failed to lock front buffer on /dev/dri/card1: gbm_surface_lock_front_buffer failed
   clutter_frame_clock_dispatch: code should not be reached
   ```
-- Also seen near the end of the 14h boot (15 occurrences):
+- Also near the end of the 14h boot (15 occurrences):
   ```
   [drm:nv_drm_gem_alloc_nvkms_memory_ioctl [nvidia_drm]] *ERROR* Failed to allocate NVKMS memory for GEM object
   ```
-- `nvidia-smi` VRAM consumers at time of freeze:
-  - `gnome-shell` **2163 MiB** (abnormal — mutter should use a few hundred MB; this is a leak)
-  - VS Code GPU process **1669 MiB**
-  - Total **4661 / 6144 MiB and climbing**
-- System stayed responsive over SSH throughout -> display/compositor freeze, not a
+- VRAM that boot was higher: `gnome-shell` 2163 MiB, VS Code 1669 MiB, total
+  **4661 / 6144 MiB**.
+
+**Jun 10 occurrence (NO VRAM signature — corrects the theory):**
+- Froze at **3215-3423 / 6144 MiB** — VRAM was NOT near the ceiling.
+- **Zero** `gbm_surface_lock_front_buffer`, NVKMS-alloc, Xid, or NVRM errors this boot.
+- gnome-shell stayed alive and logging through the freeze.
+- So the freeze is **not tied to a fixed VRAM threshold** and the Jun 9 gbm errors
+  were likely a *symptom* of the same compositor stall under heavier load, not the
+  root cause. Common denominator across both: GNOME-Wayland + NVIDIA + 3 monitors.
+- System stayed responsive over SSH in both -> display/compositor freeze, not a
   full lockup.
 
 ### Ruling out the NVIDIA driver
@@ -107,15 +292,25 @@ boot Jun 9 11:44 -> ...      (Mode B: display froze, system alive)
 
 ---
 
-## Root cause
+## Root cause (revised 2026-06-10)
 
-**Kernel `6.17.0-35-generic`** destabilized the passed-through NVIDIA GPU on this VM:
+Two independent issues, only one of which was about the kernel:
 
-- **Mode A:** GPU RTD3 (runtime D3cold power-gating) cannot be resumed by the VM's
-  virtual ACPI platform after idle -> silent hard freeze.
-- **Mode B:** under VRAM pressure (gnome-shell leak + heavy GPU apps on a 6 GB card),
-  the driver fails buffer/VRAM allocation -> mutter can't lock a front buffer ->
-  display sticks.
+- **Mode A (kernel-related, fixed):** on kernel `6.17.0-35`, GPU RTD3 (runtime
+  D3cold power-gating) could not be resumed by the VM's virtual ACPI platform after
+  idle -> silent hard freeze every ~1.5-2.5h. Disabling RTD3 fixed this and the fix
+  holds.
+- **Mode B (the recurring problem — NOT the kernel, NOT VRAM):** a compositor /
+  page-flip display freeze under **GNOME-Wayland + NVIDIA proprietary + 3 monitors**.
+  One screen sticks first, then the UI on the other two. gnome-shell's process stays
+  alive (keeps logging, SSH responsive) — only rendering for the affected outputs
+  stalls. Two prior theories were disproven:
+  - **NOT the kernel:** recurred 2026-06-10 on the "known-good" `6.17.0-29` with RTD3
+    off.
+  - **NOT VRAM exhaustion:** froze at ~3.2 GB / 6 GB with zero gbm/NVKMS/Xid errors.
+  - **Leading hypothesis:** mutter per-output frame-clock / NVIDIA page-flip VSYNC
+    desync (mutter logged `Invalid sequence for VSYNC frame info`). Best fix to test:
+    switch the session **Wayland -> Xorg**.
 
 ---
 
@@ -126,33 +321,54 @@ boot Jun 9 11:44 -> ...      (Mode B: display froze, system alive)
 | 0 | before Jun 8 | (baseline) kernel 6.17.0-29, RTD3 enabled | Stable for weeks, days of uptime |
 | 1 | Jun 8 ~13:00 | Auto-update reboot brought up kernel 6.17.0-35 | Instability begins: hard freezes every ~1.5-2.5h |
 | 2 | Jun 8 (user) | Manual hard resets after each freeze | Temporary only; froze again each time |
-| 3 | Jun 8 21:25 | **Attempt 1 — disable RTD3** (modprobe `NVreg_DynamicPowerManagement=0x00` + udev `power/control=on` + live sysfs + `update-initramfs`), then reboot | Big improvement: uptime ~2h -> **~14h**, clean shutdown. **Mode A solved.** But Mode B (VRAM exhaustion) still eventually froze the display. |
-| 4 | Jun 9 11:44 | Running again on 6.17.0-35 with RTD3 off | After ~5.5h, display stuck again: `gbm_surface_lock_front_buffer failed` every ~60s, gnome-shell holding 2.1 GB VRAM. System still alive over SSH. |
-| 5 | Jun 9 (diag) | Confirmed driver unchanged since May 21; isolated kernel 6.17.0-35 (installed Jun 4) as the trigger | Root cause identified |
-| 6 | Jun 9 ~17:30 | **Attempt 2 (current fix) — roll back to kernel 6.17.0-29** + `apt-mark hold` 6.17.0-35 + pin `GRUB_DEFAULT`, then reboot | Booted 6.17.0-29, RTD3 still off, VRAM reset to ~1 GB. **Under observation.** |
+| 3 | Jun 8 21:25 | **Attempt 1 — disable RTD3** (modprobe `NVreg_DynamicPowerManagement=0x00` + udev `power/control=on` + live sysfs + `update-initramfs`), then reboot | Big improvement: uptime ~2h -> **~14h**, clean shutdown. **Mode A solved** (this fix holds). But Mode B (display freeze) still eventually occurred. |
+| 4 | Jun 9 11:44 | Running again on 6.17.0-35 with RTD3 off | After ~5.5h, display stuck again: `gbm_surface_lock_front_buffer failed` every ~60s, gnome-shell ~2.1 GB VRAM. System still alive over SSH. |
+| 5 | Jun 9 (diag) | Suspected kernel 6.17.0-35 as the Mode B trigger | **Later disproven** (see #8) — this was a wrong call |
+| 6 | Jun 9 ~17:30 | **Attempt 2 — roll back to kernel 6.17.0-29** + `apt-mark hold` 6.17.0-35 + pin `GRUB_DEFAULT`, then reboot | Booted 6.17.0-29, RTD3 off. Looked fixed — but Mode B was just slow to return. |
 | 7 | Jun 9 17:25 | User ran `apt-get upgrade -y` | Upgraded ~40 unrelated packages; **kernel and NVIDIA untouched**, holds + pin intact |
+| 8 | Jun 10 ~00:15 | **Mode B recurred on 6.17.0-29** (RTD3 off). Live diag: froze at **3.2 GB/6 GB** VRAM, zero gbm/NVKMS/Xid errors, gnome-shell still alive | Disproves both the kernel and VRAM theories. Reframed as a Wayland/NVIDIA/multi-monitor compositor stall. **Next: test Xorg.** |
+| 9 | Jun 10 ~00:37 | **Second live diag during a freeze.** Confirmed gnome-shell in `Ssl` blocked sleep (page-flip wait, not crash/spin); the lone "NVRM" line is just the boot banner (zero real Xid); VRAM 3.2 GB. Separated two distinct problems: (a) NVIDIA↔mutter Wayland page-flip stall = the freeze; (b) Firefox AppArmor OpenH264 crash-loop = aggravator, root-caused to 2294 mmap denials/boot | User **rules out Xorg** (staying on Wayland). Reframed plan to Wayland-only fixes. |
+| 10 | Jun 10 ~00:50 | **Per-pipe probe** of DRM atomic state (`/sys/kernel/debug/dri/1/state`) during the same freeze: sampled each CRTC's scanout `fb` over 15 s. DP-1 (crtc-0) still flipping; **DP-3 (crtc-2) first to freeze** (user-confirmed it's a DP screen); HDMI-A-1 followed; HW cursor also frozen. All three **identical 3840x2160@60** → refresh-mismatch ruled out. DP-2 port is free. | First-to-freeze output identified = **DP-3**. Next: DP-3 swap test (→ free DP-2) + disable VRR in its OSD. |
+| 10 | Jun 10 ~00:46 | **Attempt 3 — fix Firefox AppArmor codec crash-loop.** Added `/etc/apparmor.d/local/firefox` (`owner @{HOME}/.mozilla/firefox/*/gmp-*/**/lib*.so mr,`) + `apparmor_parser -r`. **Verified:** rule live in-kernel, zero new denials in a 25s `journalctl -f` watch | **Aggravator removed.** Does not by itself address the Wayland page-flip stall (mitigation #1 still pending). |
 
 ### What did NOT work / was ruled out
 
 - **Hard resets** — recover briefly, freeze returns (treats symptom only).
 - **NVIDIA driver as suspect** — ruled out: `580.159.03` installed 2026-05-21, ran
   stable for ~2.5 weeks.
-- **RTD3 disable alone** — necessary and effective for Mode A, but insufficient on its
-  own: the VRAM/buffer-exhaustion freeze (Mode B) still occurs on kernel 6.17.0-35.
+- **RTD3 disable alone** — necessary and effective for Mode A, but does not address
+  Mode B (the compositor display freeze).
+- **Kernel rollback to 6.17.0-29** — did NOT fix Mode B (recurred on it Jun 10). The
+  kernel was never the Mode B cause; keep the pin only as belt-and-suspenders for Mode A.
+- **"VRAM exhaustion" theory** — ruled out: Mode B froze at ~3.2 GB / 6 GB with no
+  allocation-failure errors.
 
 ---
 
-## Current fix (active)
+## Current state (active)
 
-Both changes are live on the guest right now:
+Live on the guest right now:
 
 1. **RTD3 disabled** — `/etc/modprobe.d/nvidia-no-rtd3.conf` +
    `/etc/udev/rules.d/80-nvidia-no-rtd3.rules` (param `DynamicPowerManagement: 0`).
-2. **Booted on known-good kernel 6.17.0-29** — pinned via `GRUB_DEFAULT`, with
-   `6.17.0-35` held so it can't be auto-selected or pulled.
+   **This resolves Mode A and should stay.**
+2. **Booted on kernel 6.17.0-29** — pinned via `GRUB_DEFAULT`, `6.17.0-35` held.
+   **Did NOT fix Mode B** (it recurred here). Kept only as belt-and-suspenders for
+   Mode A; not load-bearing for the display freeze.
+3. **Firefox AppArmor OpenH264 fix — APPLIED & VERIFIED 2026-06-10 ~00:46.**
+   `/etc/apparmor.d/local/firefox` allows `mmap` of the GMP codecs; profile reloaded
+   live; zero new denials confirmed. Removes the crash-loop **aggravator** (not the
+   freeze root cause).
 
-State: `uname -r = 6.17.0-29-generic`, `DynamicPowerManagement: 0`, VRAM ~1 GB at boot.
-**Now being monitored** for multi-day stability (see "What to watch").
+State: `uname -r = 6.17.0-29-generic`, `DynamicPowerManagement: 0`, session = Wayland,
+Firefox AppArmor override active.
+
+**Mode B is still OPEN** (the page-flip stall is unaddressed — the only pending
+high-impact item is mitigation #1, NVIDIA Wayland frame-timing hardening). User has
+chosen to **stay on Wayland (Xorg ruled out)**, so
+the next planned steps are the **Wayland-only** fixes: (1) NVIDIA frame-timing hardening
+(uniform refresh rate, disable VRR, `NVreg_PreserveVideoMemoryAllocations=1`) and
+(2) fix the Firefox AppArmor OpenH264 crash-loop. See "What to watch" -> Mitigations.
 
 ---
 
@@ -186,7 +402,7 @@ echo on | sudo tee /sys/bus/pci/devices/0000:01:00.0/power/control
 
 Result: next boot ran **~14 hours** (vs ~2h) and ended cleanly.
 
-### 2. Pin known-good kernel 6.17.0-29 (addresses Mode B) — 2026-06-09
+### 2. Pin kernel 6.17.0-29 — 2026-06-09 (did NOT fix Mode B; kept for Mode A only)
 
 ```bash
 # backup
@@ -225,12 +441,99 @@ or NVIDIA packages — `apt upgrade` never installs new kernels, and the hold + 
 
 ## What to watch
 
-- **If stable for days:** kernel `6.17.0-35` was the culprit. Keep it held; revisit when
-  a newer kernel ships (then unhold, test, and re-pin or clear the pin).
-- **If Mode B recurs even on 6.17.0-29** (`gbm_surface_lock_front_buffer failed` +
-  gnome-shell VRAM climbing): it's a mutter/GNOME VRAM leak independent of the kernel.
-  Mitigate by restarting the session periodically or keeping fewer heavy GPU apps
-  (VS Code + Firefox + Chrome) open at once.
+> 2026-06-10: Mode B is CONFIRMED kernel-independent (recurred on `6.17.0-29`) and
+> CONFIRMED not VRAM exhaustion (froze at 3.2 GB). The kernel hold can stay as
+> belt-and-suspenders for Mode A, but the real fix targets the Wayland/NVIDIA
+> compositor path, not memory.
+
+- **Watch for:** display sticking one screen then the others, while SSH stays up and
+  gnome-shell keeps logging. Check `journalctl -b 0 | grep -i "VSYNC frame info"`.
+  VRAM level is NOT a reliable predictor (froze at ~52% used).
+
+### Mitigations (Wayland-only — Xorg ruled out by user 2026-06-10)
+
+The user wants to **stay on GNOME-Wayland**, so the Xorg A/B is not available. Ordered
+by likely impact within Wayland:
+
+1. **NVIDIA Wayland frame-timing hardening (targets the freeze root cause).** The stall
+   is a page-flip-completion desync, so stabilise that path:
+   - Ensure `nvidia-drm.modeset=1` (required for Wayland; verify it's set).
+   - Add `options nvidia NVreg_PreserveVideoMemoryAllocations=1` (alongside the existing
+     `nvidia-no-rtd3.conf`) so the driver doesn't churn allocations across power events.
+   - ~~Set all three monitors to the SAME refresh rate~~ — **already satisfied / ruled
+     out.** The 2026-06-10 per-pipe probe proved all three are identical 3840x2160@60, so
+     mixed-refresh is NOT the trigger here. Skip this lever.
+   - **VRR / adaptive-sync — status checked 2026-06-10 ~01:10, hypothesis WEAKENED.**
+     The only software-controllable VRR lever, GNOME/mutter's experimental
+     `variable-refresh-rate`, is **already OFF**: `gsettings get org.gnome.mutter
+     experimental-features` → `@as []` (empty). `~/.nvidia-settings-rc` has no G-Sync/VRR
+     entries, and `monitors.xml` confirms 60 Hz active on all outputs. So there is **no
+     compositor-side VRR to disable** — nothing for a remote fix to act on. VRR could only
+     still be active if the **DP-3 panel forces adaptive-sync from its own OSD** (firmware,
+     not software-readable). **Why it can't be inspected/changed remotely:** the OSD is
+     panel firmware with no OS access, and NVIDIA's closed driver hides VRR state from
+     sysfs/debugfs (`vrr_capable` = `n/a`), exposing it only via `nvidia-settings` on a
+     live display. With compositor VRR confirmed off, VRR is **no longer the leading
+     suspect** — the `VSYNC frame info` desync can occur at fixed 60 Hz too. Still worth a
+     30-second physical OSD check on DP-3, but demoted below the swap test.
+   - Re-test for multi-day stability and re-check `grep -c "VSYNC frame info"`.
+
+   **DP-3-targeted localization (do this first — it's the cheapest signal):**
+   - **Swap test:** move the **DP-3 monitor to the free DP-2 port** (or swap the DP-1 and
+     DP-3 cables). After the next freeze, see what the first-to-freeze screen tells you:
+     follows the **monitor** → that panel's EDID/VRR is the trigger; follows the **cable**
+     → marginal 4K@60 DP cable dropping flip-completions; stays on the **GPU port** →
+     driver/pipe issue.
+2. **Fix the Firefox AppArmor codec crash-loop (removes the aggravator). [APPLIED
+   2026-06-10 ~00:46]** Root-caused 2026-06-10: the enforced `firefox` profile blocks
+   `mmap` of the OpenH264 GMP codec. The profile already pulls in `<local/firefox>`, so
+   a local override was added and the profile reloaded live. **Verified:** rule present
+   in-kernel via `apparmor_parser -p`, last `gmpopenh264` denial `00:41:47` (pre-reload),
+   zero new denials in a 25s live `journalctl -f` watch afterward. Reload applies to
+   running Firefox procs; a fresh Firefox start once the display recovers picks it up
+   cleanly. Command used:
+   ```bash
+   # on the guest (fish shell; sudo non-passwordless; pw from .env $PROXMOX_MAIN_SUDO_PW):
+   echo "$PROXMOX_MAIN_SUDO_PW" | sudo -S tee /etc/apparmor.d/local/firefox >/dev/null <<'EOF'
+   # Allow Firefox to mmap the Gecko Media Plugins it downloads into the user profile
+   # (OpenH264 etc.) — fixes libxul.so null-deref crash-loop on H.264 video.
+   owner @{HOME}/.mozilla/firefox/*/gmp-*/**/lib*.so mr,
+   EOF
+   echo "$PROXMOX_MAIN_SUDO_PW" | sudo -S apparmor_parser -r /etc/apparmor.d/firefox
+   ```
+   Then fully restart Firefox and confirm `journalctl -b 0 | grep -c gmpopenh264`
+   stops climbing. (Alternative if you don't need H.264: disable Firefox HW video accel
+   via `about:config` `media.gmp-gmpopenh264.enabled=false`, or `gfx.webrender.force-disabled=true`.)
+3. **Recover a frozen display WITHOUT a full reboot:** `sudo systemctl restart gdm`
+   (ends the GUI session — closes open windows). Useful stopgap until 1+2 prove out.
+4. **Compositor/driver currency** — a newer `mutter` / NVIDIA driver may fix the
+   VSYNC-sequence handling; revisit when one ships.
+5. **(Explicitly declined) Wayland -> Xorg.** Would avoid mutter's per-output frame
+   clock and is the cleanest confirmation A/B, but the user has chosen to stay on
+   Wayland. Recorded here only for completeness.
+
+### Open question / how to confirm root cause
+
+The Wayland-frame-timing hypothesis is medium-confidence, inferred from the
+`Invalid sequence for VSYNC frame info` log line, the one-screen-then-others symptom,
+and (2026-06-10) gnome-shell sitting in **`Ssl` blocked sleep** — parked on a page-flip
+completion that never arrives.
+
+The cleanest confirmation A/B (run on **Xorg** for a few days) has been **declined** —
+the user is staying on Wayland. So within Wayland we confirm by elimination instead:
+apply the frame-timing hardening (disable VRR on DP-3,
+`NVreg_PreserveVideoMemoryAllocations=1`) and the Firefox/AppArmor fix, then watch
+whether freezes stop and whether `VSYNC frame info` recurs. (Uniform refresh rate is
+already the case — probe-confirmed all 3840x2160@60 — so it's not a lever here.) If
+freezes persist with a VRR-off, Firefox-stable config, the cause is lower in the stack
+(driver/passthrough/KMS) and needs a different angle.
+
+**Proposed next artifact — freeze-onset logger.** To turn "which froze first" from
+eyeballing into logged proof, install a lightweight sampler (systemd timer or background
+loop) that records each CRTC's scanout `fb` ID with timestamps using the per-pipe probe
+above. At the next freeze it captures the exact moment DP-3 stops flipping and the
+cascade order to the other outputs — confirming the stall sequence and onset time. (Not
+yet installed; offered 2026-06-10.)
 
 ---
 
@@ -253,15 +556,25 @@ sudo update-initramfs -u
 
 ## Quick diagnostic reference
 
+> NOTE: over SSH the guest shell is **fish** — wrap bash-isms in `bash -c '...'`, and
+> sudo is non-passwordless: `echo "$PROXMOX_MAIN_SUDO_PW" | sudo -S <cmd>` (the var comes
+> from the gitignored `.env`; load it first with `set -a; source .env; set +a`).
+
 ```bash
-# is the display frozen but system alive? look for this every ~60s:
+# Mode B (compositor stall) fingerprint this boot — the most useful single check:
+sudo journalctl -b 0 | grep -i 'Invalid sequence for VSYNC frame info'
+
+# session type (Wayland vs Xorg) — Mode B is a Wayland-path issue:
+loginctl show-session "$(loginctl | awk '/proxmox-ml5/{print $1; exit}')" -p Type
+
+# older VRAM-pressure signature (was present Jun 9, absent Jun 10):
 sudo journalctl -b 0 --since "15 min ago" | grep -i 'gbm_surface_lock_front_buffer\|NVKMS memory'
 
-# VRAM usage + top consumers:
+# VRAM usage + top consumers (note: froze at only ~3.2 GB, so not a reliable predictor):
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 nvidia-smi   # see Processes table
 
-# confirm RTD3 disabled:
+# confirm RTD3 disabled (Mode A fix):
 cat /proc/driver/nvidia/params | grep DynamicPowerManagement
 
 # boot history (hard freeze = no clean shutdown markers at end of a boot):
@@ -269,4 +582,9 @@ sudo journalctl --list-boots
 
 # recover a frozen display WITHOUT a full reboot (ends the GNOME session):
 sudo systemctl restart gdm
+
+# switch session Wayland -> Xorg (the planned Mode B test): set in /etc/gdm3/custom.conf
+#   [daemon]
+#   WaylandEnable=false
+# then: sudo systemctl restart gdm   (or just pick "GNOME on Xorg" at the login gear)
 ```
