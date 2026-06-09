@@ -4,8 +4,8 @@
 **Machine:** VM 109 "Main" (`proxmox_main`, hostname `proxmox-ml5`, 192.168.2.20)
 **Status:** RE-OPENED — froze again on the "known-good" kernel 6.17.0-29 with RTD3
 already disabled, **at only ~3.2 GB / 6 GB VRAM**. Not the kernel, and NOT VRAM
-exhaustion, and NOT a refresh-rate mismatch (all three outputs are identical
-3840x2160@60). Leading cause: a GNOME-Wayland + NVIDIA + multi-monitor compositor /
+exhaustion, and NOT a between-output refresh mismatch (all three were uniform 59.94 Hz;
+now forced to a uniform exact 60.000 Hz). Leading cause: a GNOME-Wayland + NVIDIA + multi-monitor compositor /
 page-flip stall. **Per-pipe probe (2026-06-10) localized the first-to-freeze output to
 DP-3 (crtc-2)** — a DisplayPort monitor (user-confirmed); DP-1 survives longest. Next:
 DP-3-targeted swap test + disable VRR in that monitor's OSD (Xorg ruled out by user).
@@ -169,9 +169,9 @@ whose `fb=` stops advancing is the one that stopped flipping.
 
 | Output | Pipe | Mode | 15 s flip test | Verdict |
 |--------|------|------|----------------|---------|
-| **DP-1**     | crtc-0 | 3840x2160@60 | primary `fb` toggling 151↔153 | **alive** (last survivor) |
-| **DP-3**     | crtc-2 | 3840x2160@60 | primary `fb` not advancing      | **first to freeze** (user-confirmed) |
-| **HDMI-A-1** | crtc-1 | 3840x2160@60 | primary `fb` latched at 154     | stalled (followed) |
+| **DP-1**     | crtc-0 | 3840x2160@59.94 (now 60.000) | primary `fb` toggling 151↔153 | **alive** (last survivor) |
+| **DP-3**     | crtc-2 | 3840x2160@59.94 (now 60.000) | primary `fb` not advancing      | **first to freeze** (user-confirmed) |
+| **HDMI-A-1** | crtc-1 | 3840x2160@59.94 (now 60.000) | primary `fb` latched at 154     | stalled (followed) |
 | DP-2         | —      | disconnected | — | **free port available** |
 
 Findings this session:
@@ -180,9 +180,13 @@ Findings this session:
   observation ("the dp screen freezes first") overrides it. DP-1 is the pipe that keeps
   compositing longest (it falls back to a **software cursor baked into its primary**,
   which is why its `fb` keeps toggling while the hardware cursor plane is frozen).
-- **Refresh-rate mismatch is RULED OUT.** All three outputs are **identical
-  3840x2160@60** (pixel clock 593.41 MHz). The "set all monitors to the same refresh
-  rate" mitigation is therefore *already satisfied* — that lever is exhausted, not a fix.
+- **Refresh-rate mismatch is RULED OUT (between-output).** At probe time all three
+  outputs were **uniform** — pixel clock **593410 kHz, total 4400x2250 = 59.94 Hz**
+  (nominal "60", but actually the fractional NTSC-style rate, *not* exact 60.000).
+  **Correction:** an earlier note here said "identical 3840x2160@60" — that conflated
+  59.94 and 60.00; they matched each other, but at 59.94. So the "set all monitors to the
+  same refresh rate" lever was *already satisfied* (uniform) — see the later config-change
+  update for the move to a uniform exact-60.000.
 - **The hardware cursor plane was frozen too** (pinned to crtc-0 at a fixed position for
   16 s of sampling), i.e. by this point the freeze had progressed past "mouse still moves
   on two."
@@ -199,6 +203,45 @@ snap(){ sudo cat /sys/kernel/debug/dri/1/state 2>/dev/null | awk '
   /allocated by/{ if(crtc!=""&&crtc!="crtc=(null)"){tag=($0~/gnome-shell/)?"PRIMARY":"cursor"; print crtc" "tag" "fb} }'; }
 for i in 1 2 3 4 5 6; do echo "--- t=$(((i-1)*3))s ---"; snap; [ $i -lt 6 ] && sleep 3; done
 # The CRTC whose PRIMARY fb never changes = the stalled/frozen output.
+```
+
+---
+
+## Update — 2026-06-10 (config change: refresh forced to uniform exact-60.000)
+
+After the display was recovered (gdm restart), the user changed the refresh rate in
+GNOME Settings → Displays. The per-CRTC active modes were re-read from debugfs
+(computing Hz from `pixclock / (htotal*vtotal)`, since the closed driver doesn't expose
+refresh directly):
+
+```
+BEFORE (first probe):  all three  pixclock 593410 kHz, total 4400x2250  -> 59.940 Hz  (uniform)
+AFTER  (user change):
+  DP-1      (crtc-0)   pixclock 594000 kHz  total 4400x2250 (CEA)            -> 60.0000 Hz
+  HDMI-A-1  (crtc-1)   pixclock 533280 kHz  total 4000x2222 (reduced-blank)  -> 60.0000 Hz
+  DP-3      (crtc-2)   pixclock 533280 kHz  total 4000x2222 (reduced-blank)  -> 60.0000 Hz
+```
+
+- **End state is the ideal config: all three at exactly 60.0000 Hz vertical refresh.**
+  The horizontal timings differ (DP-1 on standard CEA, the other two on reduced-blanking),
+  but that's irrelevant to the freeze — the frame-clock cadence is set by the *vertical*
+  period (now identical 16.6667 ms on all three). Keep this setting.
+- **Honest impact assessment (low-to-medium confidence):** this did NOT *remove* a
+  between-output mismatch, because the earlier snapshot showed the outputs were already
+  uniform (all 59.94). It swapped uniform-59.94 for uniform-60.000. It still plausibly
+  helps because (1) it eliminates any *intermittent* 59.94/60.00 split a single snapshot
+  couldn't rule out, and (2) some NVIDIA-Wayland setups are anecdotally steadier on an
+  exact integer rate than on fractional 59.94 (repeating-decimal frame period). Not
+  bankable as "the fix" — confirm via the freeze-onset logger over a multi-hour soak.
+- **Verdict on the refresh angle:** uniform vertical refresh is now confirmed and forced
+  to an exact integer; the between-output mismatch lever is fully closed. If freezes
+  persist on uniform 60.000, the cause is not refresh timing.
+
+**Re-read the per-CRTC refresh anytime (run as root — modes/pixclock need it):**
+```bash
+node=$(for n in /sys/kernel/debug/dri/*/state; do grep -q 'crtc=crtc-' "$n" && { echo "$n"; break; }; done)
+awk '/^crtc\[[0-9]+\]:/{c=$NF} /^\tmode:/{n=split($0,a," ");p=a[4];h=a[8];v=a[12];
+  if(p+0>0)printf "%-8s %s pix=%skHz tot=%sx%s -> %.4f Hz\n",c,a[2],p,h,v,(p*1000.0)/(h*v)}' "$node"
 ```
 
 ---
@@ -328,8 +371,10 @@ Two independent issues, only one of which was about the kernel:
 | 7 | Jun 9 17:25 | User ran `apt-get upgrade -y` | Upgraded ~40 unrelated packages; **kernel and NVIDIA untouched**, holds + pin intact |
 | 8 | Jun 10 ~00:15 | **Mode B recurred on 6.17.0-29** (RTD3 off). Live diag: froze at **3.2 GB/6 GB** VRAM, zero gbm/NVKMS/Xid errors, gnome-shell still alive | Disproves both the kernel and VRAM theories. Reframed as a Wayland/NVIDIA/multi-monitor compositor stall. **Next: test Xorg.** |
 | 9 | Jun 10 ~00:37 | **Second live diag during a freeze.** Confirmed gnome-shell in `Ssl` blocked sleep (page-flip wait, not crash/spin); the lone "NVRM" line is just the boot banner (zero real Xid); VRAM 3.2 GB. Separated two distinct problems: (a) NVIDIA↔mutter Wayland page-flip stall = the freeze; (b) Firefox AppArmor OpenH264 crash-loop = aggravator, root-caused to 2294 mmap denials/boot | User **rules out Xorg** (staying on Wayland). Reframed plan to Wayland-only fixes. |
-| 10 | Jun 10 ~00:50 | **Per-pipe probe** of DRM atomic state (`/sys/kernel/debug/dri/1/state`) during the same freeze: sampled each CRTC's scanout `fb` over 15 s. DP-1 (crtc-0) still flipping; **DP-3 (crtc-2) first to freeze** (user-confirmed it's a DP screen); HDMI-A-1 followed; HW cursor also frozen. All three **identical 3840x2160@60** → refresh-mismatch ruled out. DP-2 port is free. | First-to-freeze output identified = **DP-3**. Next: DP-3 swap test (→ free DP-2) + disable VRR in its OSD. |
 | 10 | Jun 10 ~00:46 | **Attempt 3 — fix Firefox AppArmor codec crash-loop.** Added `/etc/apparmor.d/local/firefox` (`owner @{HOME}/.mozilla/firefox/*/gmp-*/**/lib*.so mr,`) + `apparmor_parser -r`. **Verified:** rule live in-kernel, zero new denials in a 25s `journalctl -f` watch | **Aggravator removed.** Does not by itself address the Wayland page-flip stall (mitigation #1 still pending). |
+| 11 | Jun 10 ~00:50 | **Per-pipe probe** of DRM atomic state during the same freeze: sampled each CRTC's scanout `fb` over 15 s. DP-1 (crtc-0) still flipping; **DP-3 (crtc-2) first to freeze** (user-confirmed it's a DP screen); HDMI-A-1 followed; HW cursor also frozen. All three uniform **3840x2160@59.94** → between-output refresh-mismatch ruled out. DP-2 port is free. | First-to-freeze output identified = **DP-3**. Next: DP-3 swap test (→ free DP-2) + disable VRR in its OSD. |
+| 12 | Jun 10 ~01:05 | **Display recovered** via `systemctl restart gdm` (3 outputs back, fresh gnome-shell). Installed **freeze-onset logger** (`gpu-freeze-onset.service` → `/var/log/gpu-freeze-onset.log`); v1 false-positived on idle secondary monitors, fixed in **v2** (was-busy gate + VSYNC/gshell correlation). | Recovery confirmed; per-CRTC stall timeline now captured for the next freeze. |
+| 13 | Jun 10 ~01:30 | **Attempt 4 — user forced uniform exact-60.000 Hz** (GNOME Displays). Re-probe: all three now **60.0000 Hz** vertical (DP-1 CEA 594000 kHz; HDMI-A-1 + DP-3 reduced-blank 533280 kHz). Was uniform-59.94 before. | Refresh angle fully closed (uniform exact-integer). Low-to-med confidence as a fix; soak with the logger. |
 
 ### What did NOT work / was ruled out
 
@@ -460,9 +505,10 @@ by likely impact within Wayland:
    - Ensure `nvidia-drm.modeset=1` (required for Wayland; verify it's set).
    - Add `options nvidia NVreg_PreserveVideoMemoryAllocations=1` (alongside the existing
      `nvidia-no-rtd3.conf`) so the driver doesn't churn allocations across power events.
-   - ~~Set all three monitors to the SAME refresh rate~~ — **already satisfied / ruled
-     out.** The 2026-06-10 per-pipe probe proved all three are identical 3840x2160@60, so
-     mixed-refresh is NOT the trigger here. Skip this lever.
+   - ~~Set all three monitors to the SAME refresh rate~~ — **DONE / lever closed.** The
+     per-pipe probe showed all three were already uniform at 59.94 Hz, and on 2026-06-10
+     ~01:30 the user forced them to a uniform **exact 60.0000 Hz** (see the config-change
+     update). Between-output mismatch is not the trigger here. Now soaking on uniform-60.
    - **VRR / adaptive-sync — status checked 2026-06-10 ~01:10, hypothesis WEAKENED.**
      The only software-controllable VRR lever, GNOME/mutter's experimental
      `variable-refresh-rate`, is **already OFF**: `gsettings get org.gnome.mutter
@@ -523,9 +569,10 @@ The cleanest confirmation A/B (run on **Xorg** for a few days) has been **declin
 the user is staying on Wayland. So within Wayland we confirm by elimination instead:
 apply the frame-timing hardening (disable VRR on DP-3,
 `NVreg_PreserveVideoMemoryAllocations=1`) and the Firefox/AppArmor fix, then watch
-whether freezes stop and whether `VSYNC frame info` recurs. (Uniform refresh rate is
-already the case — probe-confirmed all 3840x2160@60 — so it's not a lever here.) If
-freezes persist with a VRR-off, Firefox-stable config, the cause is lower in the stack
+whether freezes stop and whether `VSYNC frame info` recurs. (Uniform refresh is now
+forced to an exact **60.0000 Hz** on all three — probe-confirmed; previously uniform
+59.94 — so the between-output mismatch lever is closed.) If freezes persist with a
+uniform-60.000, VRR-off, Firefox-stable config, the cause is lower in the stack
 (driver/passthrough/KMS) and needs a different angle.
 
 ### Freeze-onset logger — INSTALLED 2026-06-10 ~01:53
