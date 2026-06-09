@@ -528,12 +528,37 @@ already the case — probe-confirmed all 3840x2160@60 — so it's not a lever he
 freezes persist with a VRR-off, Firefox-stable config, the cause is lower in the stack
 (driver/passthrough/KMS) and needs a different angle.
 
-**Proposed next artifact — freeze-onset logger.** To turn "which froze first" from
-eyeballing into logged proof, install a lightweight sampler (systemd timer or background
-loop) that records each CRTC's scanout `fb` ID with timestamps using the per-pipe probe
-above. At the next freeze it captures the exact moment DP-3 stops flipping and the
-cascade order to the other outputs — confirming the stall sequence and onset time. (Not
-yet installed; offered 2026-06-10.)
+### Freeze-onset logger — INSTALLED 2026-06-10 ~01:53
+
+A "flight recorder" for the next freeze. Records each CRTC's scanout `fb` ID with
+timestamps so a reported freeze can be reconstructed: which output's `fb` went stale
+first (onset order) and whether the driver fingerprint fired.
+
+- **Script:** `/usr/local/sbin/gpu-freeze-onset.sh` (root; reads `/sys/kernel/debug/dri/*/state`)
+- **Service:** `gpu-freeze-onset.service` (enabled, `Restart=always`, `WantedBy=multi-user.target`)
+- **Log:** `/var/log/gpu-freeze-onset.log` (rotates at 5 MB → `.log.1`)
+- Samples every 3 s; **heartbeat every 30 s** is the primary artifact, logging per-CRTC
+  `fb`/age/busy + `vsync_recent` (count of `Invalid sequence for VSYNC frame info` in the
+  last ~60 s) + `gshell` process state (e.g. `Ssl`/`Rsl`).
+
+**IMPORTANT — known limitation (learned the hard way during install).** Watching `fb`
+advance alone **cannot distinguish an idle secondary monitor from a frozen one** — both
+simply stop flipping (mutter only flips a pipe when its content changes). The v1/v2
+auto-alarms produced **false positives**: e.g. `01:56:16 STALL crtc-1 … vsync_recent=0
+gshell=Rsl` — that was just idle screens after login (`gshell=Rsl` = gnome-shell
+*running*, `vsync_recent=0` = no fingerprint), **not** a freeze. So:
+- The auto-flag is now labeled **`CANDIDATE-STALL`**, a hint only, with its corroborating
+  evidence inline. A line is only a **real** freeze if it shows **`gshell=...Ssl`
+  (blocked, not running)** and/or **`vsync_recent>0`** (it self-tags `*** STRONG ***`).
+- **The verdict comes from the heartbeat timeline + the user's report**, not the
+  candidate line alone. When a freeze is reported, read the log around that time: the
+  output whose `age` started climbing first while another kept flipping = onset; confirm
+  via `gshell` blocked + `vsync_recent`.
+
+```bash
+# read it (root):  sudo tail -50 /var/log/gpu-freeze-onset.log
+# manage:          sudo systemctl status|restart|disable --now gpu-freeze-onset.service
+```
 
 ---
 
