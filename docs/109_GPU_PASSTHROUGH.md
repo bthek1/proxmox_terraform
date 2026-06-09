@@ -170,6 +170,36 @@ ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", DRIVER=="nvidia", ENV{
 
 **Why this file exists:** Ubuntu's `/usr/lib/udev/rules.d/61-gdm.rules` fires when the NVIDIA PCI device is bound at boot and unconditionally writes `PreferredDisplayServer=xorg` to `/run/gdm3/custom.conf` for all non-Dell NVIDIA systems (driver ≥ 470). This runtime file overrides the static `/etc/gdm3/custom.conf`. The `60-gdm-nvidia-wayland.rules` file runs first (lower number = higher priority) and sets `GDM_PREFER_WAYLAND=1`, which causes `61-gdm.rules` to take the `gdm_prefer_wayland` path instead.
 
+### Suspend disabled
+
+VFIO GPU passthrough and ACPI S3 suspend are incompatible. The NVIDIA GPU loses its firmware state on suspend and cannot restore it through VFIO, leaving the display blank after resume and breaking the Wayland compositor. Suspend is permanently disabled on VM 109.
+
+**Systemd targets masked** (symlinked to `/dev/null`):
+
+```bash
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+**`/etc/systemd/logind.conf`** (appended):
+
+```ini
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+```
+
+Use **`Super + L`** to lock the screen and blank the display instead. The session stays fully alive — any key or mouse movement brings it back instantly.
+
+If the VM is accidentally suspended via `qm suspend` from the Proxmox host, recover with:
+
+```bash
+# Resume the VM
+ssh -t proxmox "sudo /usr/sbin/qm resume 109"
+# Then restart GDM to restore the display
+ssh -t proxmox_main "sudo systemctl restart gdm3"
+```
+
 ### fstab — secondary drive
 
 `/etc/fstab` has a secondary 512GB ext4 drive that is not always present at boot. It must have `nofail` to prevent emergency mode:
@@ -254,6 +284,22 @@ cat /etc/pve/qemu-server/109.conf | grep usb
 lsusb
 # Remove entries for missing devices, then start
 ```
+
+### VM suspended — display blank, keyboard/mouse won't wake it
+
+**Symptom:** VM was suspended (via GNOME power menu or `qm suspend`). Keyboard and mouse do not wake it. After `qm resume`, display stays blank.
+**Cause:** VFIO GPU passthrough is incompatible with ACPI S3 suspend. The GPU loses its firmware state and the Wayland compositor crashes.
+**Fix:**
+
+```bash
+# 1. Resume the VM from the Proxmox host
+ssh -t proxmox "sudo /usr/sbin/qm resume 109"
+
+# 2. Restart GDM inside the VM to restore the display
+ssh -t proxmox_main "sudo systemctl restart gdm3"
+```
+
+**Prevention:** Suspend is permanently disabled on VM 109 (see Suspend disabled section above). Use `Super + L` to lock/blank the screen instead.
 
 ### GDM login crash — "no screens found" or "failed to acquire modesetting permission"
 
