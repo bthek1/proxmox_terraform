@@ -27,8 +27,10 @@ uv sync
 
 ## Terraform / Proxmox Conventions
 
-- Terraform files go in `terraform/` (create if needed), organized by resource type or environment
-- Use the [Telmate/proxmox](https://registry.terraform.io/providers/Telmate/proxmox/latest/docs) or [bpg/proxmox](https://registry.terraform.io/providers/bpg/proxmox/latest/docs) provider
+- Terraform config lives in `terraform/lxc/` and uses the [bpg/proxmox](https://registry.terraform.io/providers/bpg/proxmox/latest/docs) provider (`~> 0.75`); see [docs/PROXMOX_LXC_TERRAFORM_GUIDE.md](docs/PROXMOX_LXC_TERRAFORM_GUIDE.md)
+- Drive Terraform via the `justfile` recipes (`just plan`, `just apply`, `just destroy`, …) rather than raw commands
+- The Terraform CLI is **not installed on this workstation** — `plan`/`apply` run on the **gh-runner LXC (111)** via CI. To act on a live guest from here, SSH to the node and use `pct` (see `.github/instructions/proxmox.instructions.md`)
+- As of 2026-06-17 the repo manages **no live guest** (its template container 108/terraCT was destroyed); see [docs/PROXMOX_INVENTORY.md](docs/PROXMOX_INVENTORY.md)
 - Sensitive values (API tokens, passwords) must use **environment variables** or a `.tfvars` file — never hardcode credentials
 - `.tfvars` files and `*.tfstate*` files must be in `.gitignore`
 

@@ -16,6 +16,13 @@ description: "Use when accessing the Proxmox home lab server via SSH or web UI, 
 
 The SSH alias `proxmox` is pre-configured in `~/.ssh/config` — use it for all SSH operations.
 
+> **`ben` is not root.** Privileged guest/storage commands must be run via `sudo` with the **full binary path**. Passwordless (`sudo -n`) is granted only for `/usr/sbin/pct`, `/usr/bin/pveam`, and `/usr/sbin/pvesm`; any other `sudo` will prompt for a password. Example:
+>
+> ```bash
+> ssh proxmox 'sudo -n /usr/sbin/pct status 108'
+> ssh proxmox 'sudo -n /usr/sbin/pct destroy 108'   # irreversible
+> ```
+
 ## SSH Access
 
 ```bash
@@ -52,8 +59,8 @@ This server is on the `192.168.2.0/24` LAN. To access remotely, connect via the 
 just vpn-ssh   # Connect to WireGuard EC2 server
 ```
 
-Then SSH to Proxmox as normal. See [Docs/proxmox.md](../../Docs/AWS_info/proxmox.md) for full details.
+Then SSH to Proxmox as normal.
 
 ## Resource Documentation
 
-Full inventory: [Docs/proxmox.md](../../Docs/AWS_info/proxmox.md)
+Live guest inventory: [docs/PROXMOX_INVENTORY.md](../../docs/PROXMOX_INVENTORY.md)
