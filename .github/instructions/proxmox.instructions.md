@@ -61,6 +61,27 @@ just vpn-ssh   # Connect to WireGuard EC2 server
 
 Then SSH to Proxmox as normal.
 
+## Guest Management
+
+All commands run over the `proxmox` SSH alias with `sudo -n /usr/sbin/pct …` (see the note above).
+
+```bash
+# Inspect
+ssh proxmox 'sudo -n /usr/sbin/pct list'              # all containers
+ssh proxmox 'sudo -n /usr/sbin/pct config <id>'       # full config
+ssh proxmox 'sudo -n /usr/sbin/pct status <id>'
+
+# Re-IP a container (preserve every net0 field except ip=)
+ssh proxmox 'sudo -n /usr/sbin/pct set <id> -net0 name=eth0,bridge=vmbr0,firewall=1,gw=192.168.2.1,hwaddr=<MAC>,ip=192.168.2.<id>/24,ip6=dhcp,type=veth'
+
+# Destroy (irreversible — stop first if running)
+ssh proxmox 'sudo -n /usr/sbin/pct stop <id> && sudo -n /usr/sbin/pct destroy <id>'
+```
+
+> **IP convention:** every guest uses a `192.168.2.<VMID>` address (last octet = VMID). Honour this when creating or re-IP'ing containers. VM 109 (Main) follows it too as of 2026-06-17 — its `.109` is pinned by a router DHCP reservation on the VM's MAC (the host uses DHCP networking), not a `pct`/`qm` net config.
+>
+> **After re-IP / destroy:** update [docs/PROXMOX_INVENTORY.md](../../docs/PROXMOX_INVENTORY.md), the matching `Host` entry in `~/.ssh/config`, and clear any stale key with `ssh-keygen -R 192.168.2.<id>`. A re-IP applies live but old clients (SSH, services, DNS) keep pointing at the previous address until updated.
+
 ## Resource Documentation
 
 Live guest inventory: [docs/PROXMOX_INVENTORY.md](../../docs/PROXMOX_INVENTORY.md)
