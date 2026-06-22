@@ -82,6 +82,23 @@ ssh proxmox 'sudo -n /usr/sbin/pct stop <id> && sudo -n /usr/sbin/pct destroy <i
 >
 > **After re-IP / destroy:** update [docs/PROXMOX_INVENTORY.md](../../docs/PROXMOX_INVENTORY.md), the matching `Host` entry in `~/.ssh/config`, and clear any stale key with `ssh-keygen -R 192.168.2.<id>`. A re-IP applies live but old clients (SSH, services, DNS) keep pointing at the previous address until updated.
 
+## Motherboard RGB (OpenRGB)
+
+The host's RGB (ASUS PRIME X670-P WIFI — 2× ENE DRAM over SMBus + ASUS **Aura** USB
+controller `0b05:19af`) is driven by **OpenRGB running on the host** as a systemd
+service (`openrgb.service`), exposing a network server on `192.168.2.70:6742` for
+Home Assistant / any client. Full setup: [docs/OPENRGB_SERVER_SETUP.md](../../docs/OPENRGB_SERVER_SETUP.md).
+
+```bash
+ssh proxmox 'echo <pw> | sudo -S systemctl status openrgb'
+ssh proxmox 'echo <pw> | sudo -S /opt/openrgb/squashfs-root/AppRun --list-devices'   # expect 3 devices
+```
+
+> ⚠️ **Never USB-pass the Aura controller (`0b05:19af`) to a VM** (it was on VM 109
+> until 2026-06-23). QEMU claims it via `usbfs`, so the host's `usbhid` can't bind it,
+> no `/dev/hidraw` node appears, and OpenRGB sees only the DRAM. A pre-start hook
+> (`/opt/openrgb/bind-aura-hid.sh`) rebinds `usbhid` so a clean host boot Just Works.
+
 ## Resource Documentation
 
 Live guest inventory: [docs/PROXMOX_INVENTORY.md](../../docs/PROXMOX_INVENTORY.md)
