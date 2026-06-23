@@ -35,8 +35,9 @@ rm -rf "$DEST/squashfs-root"
 RUN="$DEST/squashfs-root/AppRun"
 test -x "$RUN"
 
-echo "==> Installing HID-bind helper"
+echo "==> Installing HID-bind helper + boot-state hook"
 install -m 0755 "$HERE/bind-aura-hid.sh" "$DEST/bind-aura-hid.sh"
+install -m 0755 "$HERE/apply-boot-state.sh" "$DEST/apply-boot-state.sh"
 
 echo "==> i2c-dev at boot (for the SMBus DRAM controllers)"
 echo i2c-dev > /etc/modules-load.d/openrgb.conf
@@ -55,6 +56,9 @@ ExecStartPre=-/sbin/modprobe i2c-dev
 ExecStartPre=$DEST/bind-aura-hid.sh
 # --server binds 0.0.0.0:${PORT} by default. No auth — keep it on a trusted LAN.
 ExecStart=$RUN --server --server-port ${PORT}
+# Size the Aura addressable headers (they detect as 0 LEDs) so clients can drive them.
+# Do NOT use the server-side --profile flag here — it crashes the server (exit 1).
+ExecStartPost=-$DEST/apply-boot-state.sh
 Restart=on-failure
 RestartSec=5
 

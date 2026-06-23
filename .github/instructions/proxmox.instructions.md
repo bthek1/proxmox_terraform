@@ -87,17 +87,29 @@ ssh proxmox 'sudo -n /usr/sbin/pct stop <id> && sudo -n /usr/sbin/pct destroy <i
 The host's RGB (ASUS PRIME X670-P WIFI — 2× ENE DRAM over SMBus + ASUS **Aura** USB
 controller `0b05:19af`) is driven by **OpenRGB running on the host** as a systemd
 service (`openrgb.service`), exposing a network server on `192.168.2.70:6742` for
-Home Assistant / any client. Full setup: [docs/OPENRGB_SERVER_SETUP.md](../../docs/OPENRGB_SERVER_SETUP.md).
+Home Assistant / any client. Port 6742 is open **LAN-wide** via the Proxmox cluster
+firewall (`/etc/pve/firewall/cluster.fw`, rule on `vmbr0`). Full setup, quirks, and
+the firewall details: [docs/OPENRGB_SERVER_SETUP.md](../../docs/OPENRGB_SERVER_SETUP.md).
 
 ```bash
 ssh proxmox 'echo <pw> | sudo -S systemctl status openrgb'
-ssh proxmox 'echo <pw> | sudo -S /opt/openrgb/squashfs-root/AppRun --list-devices'   # expect 3 devices
+ssh proxmox 'echo <pw> | sudo -S /opt/openrgb/squashfs-root/AppRun --list-devices'        # expect 3 devices
+# control (run as root): RAM = devices 0,1 (static); Aura board = device 2 (use Direct)
+ssh proxmox 'echo <pw> | sudo -S /opt/openrgb/squashfs-root/AppRun -d 2 --mode direct --color FFFFFF'
 ```
 
 > ⚠️ **Never USB-pass the Aura controller (`0b05:19af`) to a VM** (it was on VM 109
 > until 2026-06-23). QEMU claims it via `usbfs`, so the host's `usbhid` can't bind it,
 > no `/dev/hidraw` node appears, and OpenRGB sees only the DRAM. A pre-start hook
 > (`/opt/openrgb/bind-aura-hid.sh`) rebinds `usbhid` so a clean host boot Just Works.
+>
+> ⚠️ **Aura addressable headers detect as 0 LEDs** → the case/"PC" lights run a stuck
+> hardware rainbow that no command overrides until the zones are resized. An
+> `ExecStartPost` hook (`/opt/openrgb/apply-boot-state.sh`) resizes the 3 addressable
+> zones to 100 LEDs on every start and sets them OFF for HA to take over. Gotchas if
+> doing it by hand: resize (`-z N -s 100`) and color must be **separate** `AppRun`
+> calls (combined → segfault); the sizes are **not** saved to disk; and the server-side
+> `--profile` flag in `ExecStart` **crashes** the server — don't use it.
 
 ## Resource Documentation
 
