@@ -539,6 +539,69 @@ sudo reboot
 
 ---
 
+## Update — 2026-07-22 (evening): Mode C reverted — mouse stuck on the passed-through controller
+
+Shortly after Mode D was resolved, the **whole-controller passthrough of `0c:00.0`
+(Mode C) was reverted.** With the Brio + dongles arriving natively through the
+passed-through controller, the **mouse kept intermittently sticking**. The user switched
+the keyboard, mouse, and Brio back to **per-device USB redirection** and removed the
+`hostpci2` controller passthrough.
+
+### What broke during the switch
+
+Removing `hostpci2` and adding the `usb*` redirection entries **did not restore input** —
+the keyboard/mouse/Brio stayed dead in the guest. Root cause: `0c:00.0` was **still bound
+to `vfio-pci`** on the host (left over from the earlier passthrough), so the host could
+not enumerate the devices plugged into it, and per-device redirection can only forward a
+device **the host can see**. Symptom on the host:
+
+```
+lsusb            -> buses for 0c:00.0 (bus 3/4) missing; 047d:8188 / 25a7:fa61 / 046d:0944 absent
+.../0c:00.0/driver -> vfio-pci   (should be xhci_hcd once no longer passed through)
+```
+
+### Fix applied (host `ssh proxmox`, live — no VM restart)
+
+```bash
+# 1. Return the controller to the host so it re-enumerates the USB devices
+echo 0000:0c:00.0 | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind
+echo 0000:0c:00.0 | sudo tee /sys/bus/pci/drivers_probe      # xhci_hcd claims it (no driver_override)
+lsusb   # now shows Kensington 047d:8188, Compx 25a7:fa61, MX Brio 046d:0944
+
+# 2. Re-trigger the (already-configured) redirection forwards so the running VM hot-attaches them
+for u in usb2 usb3 usb4; do sudo qm set 109 --delete $u; done
+sudo qm set 109 --usb2 host=047d:8188    # Kensington keyboard/mouse
+sudo qm set 109 --usb4 host=25a7:fa61    # Compx keyboard/mouse
+sudo qm set 109 --usb3 host=046d:0944    # MX Brio
+```
+
+Guest verification (`qm guest exec 109 -- …`): `/proc/bus/input/devices` shows the
+**Kensington** (keyboard + mouse) and **Compx** (mouse) input nodes → input restored
+live, no VM restart. Durability: `hostpci2` is gone from the config and `0c:00.0` is not
+in `vfio.conf`, so the host owns it from boot and the forwards attach on VM start.
+
+### Current VM 109 USB/PCI config (post-revert)
+
+```
+hostpci0: 0000:08:00,pcie=1,x-vga=1     # GPU, all functions (Mode D blacklist keeps 08:00.3 clean)
+hostpci1: 0000:10:00.6,pcie=1           # AMD HD audio
+usb1: host=13d3:3571                     # Bluetooth
+usb2: host=047d:8188                     # Kensington keyboard/mouse   (redirection)
+usb3: host=046d:0944                     # MX Brio                     (redirection)
+usb4: host=25a7:fa61                     # Compx keyboard/mouse        (redirection)
+usb5: host=1bcf:2284                     # UGREEN cam
+# hostpci2 (0c:00.0) REMOVED — Mode C undone
+```
+
+> ⚠️ **The Brio (`046d:0944`) is on redirection again — this re-opens the Mode C freeze
+> risk** under heavy 4K/UVC capture (that risk is *why* Mode C existed). Light webcam use
+> is fine; for OBS set the input to **MJPEG**, or move only the Brio back to a
+> passed-through controller. Also note: with the dongles/Brio now permanent `usb-host`
+> entries, **VM 109 will refuse to start if any of them is unplugged** — replug or
+> `qm set 109 --delete usbN` first.
+
+---
+
 ## Environment & topology
 
 | Item | Detail |
