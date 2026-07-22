@@ -58,6 +58,12 @@ segfaults — which may add compositor stress; worth disabling its GPU accel too
 > separately fix the Firefox/AppArmor crash-loop. See the second 2026-06-10 update and
 > the reordered "Mitigations (Wayland-only)" below.
 
+> **2026-07-22 — Mode C added (separate root cause, fixed):** a Logitech MX Brio 4K
+> webcam over **USB device-redirection** wedged the guest during OBS capture (emulated
+> USB + high-bandwidth UVC → `videobuf2` buffer failure → display stall). Fixed by
+> **passing the physical USB controller `0c:00.0` through to VM 109**. This is *not*
+> the GPU/Wayland issue of Modes A/B. See the **2026-07-22 update** below.
+
 ---
 
 ## Update — 2026-06-10 (recurrence on the "good" kernel)
@@ -132,7 +138,7 @@ openclaw-gateway.service     -> still crash-looping every ~6s (unrelated)
   frame-clock stall. SSH responsive throughout => display-only.
 - **NOT a GPU hardware fault.** The lone "NVRM" match is the **driver load banner**, not
   an Xid. Zero real GPU errors.
-- **NOT VRAM** (3.2 GB / 6 GB, zero gbm/NVKMS alloc failures) and **NOT kernel/RTD3**
+- **NOT VRAM** (3.2 GB / 6 GB, zero gbm/NVKMS alloc failures) and *stop *NOT kernel/RTD3**
   (6.17.0-29, RTD3 off) — re-confirms the Jun-10 corrections.
 
 ### Two DISTINCT problems (do not conflate — earlier draft did)
@@ -242,6 +248,154 @@ AFTER  (user change):
 node=$(for n in /sys/kernel/debug/dri/*/state; do grep -q 'crtc=crtc-' "$n" && { echo "$n"; break; }; done)
 awk '/^crtc\[[0-9]+\]:/{c=$NF} /^\tmode:/{n=split($0,a," ");p=a[4];h=a[8];v=a[12];
   if(p+0>0)printf "%-8s %s pix=%skHz tot=%sx%s -> %.4f Hz\n",c,a[2],p,h,v,(p*1000.0)/(h*v)}' "$node"
+```
+
+---
+
+## Update — 2026-07-22 (Mode C: USB/UVC webcam passthrough freeze — NEW root cause, fixed)
+
+A **third, distinct** freeze was hit and fixed today. It shares the "monitor got
+stuck" symptom with Modes A/B but has **nothing to do with the GPU or the Wayland
+compositor path** — do not conflate it. Trigger: a newly-bought **Logitech MX Brio
+4K** webcam (`046d:0944`) used in **OBS**.
+
+### Mode C — TL;DR
+
+The Brio was reaching the VM via **QEMU USB device-redirection** (`usb2:
+host=046d:0944,usb3=1`) on the **emulated** QEMU XHCI controller (guest `07:1b.0`).
+Its high-bandwidth UVC isochronous video stream overwhelmed that emulated path:
+the guest could no longer allocate V4L2 capture buffers, `uvcvideo`/`videobuf2`
+wedged, and the GNOME session's rendering stalled — the display "got stuck." The
+VM **did not crash** (no panic); it was **manually rebooted** at 16:36:41 to recover.
+
+**Fix applied:** stop redirecting the Brio and instead **pass the whole physical USB
+controller it sits on (`0c:00.0`) through to VM 109 via PCIe passthrough**, so the
+camera talks to *real* xHCI hardware inside the guest.
+
+### Evidence (previous boot, boot `-1`, 2026-07-22)
+
+| Time | Event |
+|------|-------|
+| 15:55:55 | Brio enumerates SuperSpeed on emulated XHCI; `uvcvideo … Failed to set UVC probe control : -32` (benign enum quirk, always present) |
+| 16:09:48 → 16:21:11 | **1256×** `xhci_hcd 0000:07:1b.0: Event dma … for ep 2 status 13 not part of TD` — flood on the Brio's isochronous **video** endpoint (ep 2). Bluetooth (same emulated controller) also glitched (`SCO packet for unknown connection handle`) |
+| 16:10:35 | `usb 10-3: reset SuperSpeed USB device … using xhci_hcd` (recovery attempt) |
+| 16:16:55 | OBS `REQBUFS` fails: `v4l2-helpers: Request for buffers failed !` → `Failed to map buffers` → kernel **`WARNING … vb2_core_reqbufs+0x1e6/0x540 [videobuf2_common]`** (Comm `libobs: graphic`). **This is the freeze trigger.** |
+| ~16:20:41 | `gnome-shell … meta_wayland_buffer_process_damage: buffer->resource` assertion — display stalls |
+| 16:36:41 | Clean `systemd-reboot` (manual recovery — **not** a crash) |
+
+**Proven / disproven** (same rigor as Modes A/B):
+- **NOT the GPU.** Zero NVIDIA `Xid`/`NVRM`/reset errors in the affected boot.
+- **NOT OOM, NOT an OBS crash.** No OOM-kill, no segfault/coredump; OBS was
+  restarted by the user several times and each instance exited cleanly.
+- **Distinct from Mode B.** No mutter VSYNC/page-flip signature; the cascade starts
+  in `uvcvideo`/`videobuf2`, driven by the emulated-USB bandwidth failure.
+- Recurring, not a fluke: even the *idle* next boot logged 288 of the same TD errors.
+
+### Host USB layout (surveyed 2026-07-22)
+
+All six host USB controllers are in **their own isolated IOMMU groups** (any is
+safely passable). Map of controller → devices:
+
+| Host PCI | Controller | IOMMU grp | Devices on it |
+|----------|-----------|-----------|---------------|
+| **`0c:00.0`** | ASMedia USB 3.2 `1022:43f7` | 33 | **MX Brio** (Bus4, 20 Gb/s) · Kensington 2.4G dongle `047d:8188` · card reader `25a7:fa61` (Bus3) |
+| `0e:00.0` | ASMedia USB 3.2 `1022:43f7` | 35 | **Aura RGB `0b05:19af`** · Bluetooth `13d3:3571` (Bus5) — **must stay on host for OpenRGB** |
+| `08:00.2` | NVIDIA TU116 USB-C | 29 | (empty — GPU's own USB-C) |
+| `10:00.3` | AMD Raphael USB 3.1 | 40 | (empty) |
+| `10:00.4` | AMD Raphael USB 3.1 | 41 | UGREEN cam `1bcf:2284` (Bus9) |
+| `11:00.0` | AMD Raphael USB 2.0 | 43 | (empty) |
+
+`0c:00.0` was chosen because the Brio is **already physically plugged into it** (no
+re-cabling) and it is a **different controller** from the Aura RGB (`0e:00.0`), so
+OpenRGB is untouched. The two low-value dongles on its USB2 sibling bus were already
+VM-bound via redirection, so folding them into the controller passthrough is a net
+simplification.
+
+> ⚠️ **Do NOT bind these ASMedia controllers by device-ID in `/etc/modprobe.d/vfio.conf`.**
+> `0c:00.0` and `0e:00.0` share the **same** ID `1022:43f7`; an `ids=`-based bind would
+> also steal the Aura RGB's controller (`0e:00.0`) from the host and break OpenRGB.
+> **Address-based `hostpci` passthrough (used here) is required.**
+
+### Fix applied (2026-07-22 ~17:12, on host `ssh proxmox`)
+
+> Load the host/guest sudo password first (never stored here):
+> `set -a; source .env; set +a` → use `$PROXMOX_MAIN_SUDO_PW` with `sudo -S`.
+> Host default shell is fine for `qm`; guest shell is **fish** (wrap loops in `bash -c`).
+
+```bash
+# 0. Back up VM config  ->  /root/vm109-config-backup-20260722-171222.txt
+qm config 109 > /root/vm109-config-backup-$(date +%Y%m%d-%H%M%S).txt
+
+# 1. Stop VM (PCIe passthrough add requires the VM stopped)
+qm stop 109
+
+# 2. Pass the physical USB controller through (address-based, pcie=1, NO x-vga)
+qm set 109 --hostpci2 0000:0c:00.0,pcie=1
+
+# 3. Remove the now-redundant device-redirections that live on 0c:00.0
+#    (they now arrive natively via the passed-through controller)
+qm set 109 --delete usb2    # MX Brio        046d:0944
+qm set 109 --delete usb9    # card reader     25a7:fa61
+qm set 109 --delete usb13   # Kensington 2.4G 047d:8188
+
+# 4. Start
+qm start 109
+```
+
+Kept as redirection (they live on *other* controllers that stay with the host):
+`usb1: host=13d3:3571` (Bluetooth), `usb5: host=1bcf:2284` (UGREEN cam).
+
+VM 109 config delta:
+
+```
++ hostpci2: 0000:0c:00.0,pcie=1
+- usb2: host=046d:0944,usb3=1
+- usb9: host=25a7:fa61
+- usb13: host=047d:8188
+```
+
+### Verification
+
+- **Host:** `0c:00.0` rebinds to `vfio-pci` at VM start; `0e:00.0` **stays on
+  `xhci_hcd`** (Aura/OpenRGB safe); host `lsusb` no longer lists the Brio/dongles but
+  still lists the Aura RGB + Bluetooth. ✓
+- **Guest:** a **real ASMedia controller appears at `03:00.0`** (`1022:43f7`, driver
+  `xhci_hcd`); the Brio enumerates **SuperSpeed** on it (HID node
+  `… on usb-0000:03:00.0-1/input2`), no longer on the QEMU XHCI. ✓
+- A partial 4K MJPEG capture (`ffmpeg -f v4l2`) ran and **the VM stayed responsive**
+  (load ~1.0, SSH fine) — a stream that previously froze it. This boot logged
+  **0** `vb2_core_reqbufs` WARNINGs and **0** hard xHCI errors: **the Mode-C freeze
+  trigger did not recur.** ✓
+
+> ⚠️ **Honest caveat — the `not part of TD` log spam is NOT eliminated.** The initial
+> hypothesis ("native passthrough removes the flood") was **wrong**. During streaming
+> the **same** `xhci_hcd 0000:03:00.0: Event dma … for ep 2 status 13 not part of TD`
+> messages still appear on the **real** controller (172 during the partial capture,
+> all on ep 2). This is a **benign Logitech-Brio + `xhci_hcd` driver quirk** (short-
+> packet events on the isochronous video endpoint), not an emulation artifact — it is
+> cosmetic and did not corrupt the stream or hang anything. What the passthrough
+> actually fixed is the **emulation bottleneck** (the `videobuf2` buffer-allocation
+> failure), which was the real cause of the freeze.
+
+### Recommendation / what to watch
+
+- In **OBS**, set the Brio's input format to **Motion-JPEG** (not the default
+  uncompressed YUYV). MJPEG slashes the isochronous bandwidth and should also quiet
+  the `not part of TD` spam. The true confirmation is a real OBS session that
+  previously froze.
+- If the log spam ever needs silencing (it's benign), that's a separate follow-up
+  (UVC/xHCI quirking) — not required for stability.
+
+### Reverting Mode C (back to USB device-redirection)
+
+```bash
+qm stop 109
+qm set 109 --delete hostpci2
+qm set 109 --usb2 host=046d:0944,usb3=1
+qm set 109 --usb9 host=25a7:fa61
+qm set 109 --usb13 host=047d:8188
+qm start 109
+# full prior config: /root/vm109-config-backup-20260722-171222.txt
 ```
 
 ---
