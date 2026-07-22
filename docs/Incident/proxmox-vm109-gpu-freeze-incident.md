@@ -64,6 +64,15 @@ segfaults — which may add compositor stress; worth disabling its GPU accel too
 > **passing the physical USB controller `0c:00.0` through to VM 109**. This is *not*
 > the GPU/Wayland issue of Modes A/B. See the **2026-07-22 update** below.
 
+> **2026-07-22 (evening) — Mode D added (host-side, fixed):** after a **full PVE host
+> reboot**, VM 109 failed to start. Its boot-time autostart `qm start 109` **wedged in
+> the kernel (uninterruptible `D` state)** unbinding the GPU's USB-C/UCSI function
+> `08:00.3` (`10de:1aed`) from the host `i2c_nvidia_gpu` driver, and the stuck process
+> held the VM lock so every restart died with `can't lock file … got timeout`. **Fixed
+> by blacklisting `i2c_nvidia_gpu` (+ `i2c_ccgx_ucsi`)** so `vfio-pci` claims `08:00.3`
+> cleanly at boot (nothing to unbind → no hang). This is a passthrough **driver-unbind
+> deadlock**, not a guest display freeze. See the **2026-07-22 (evening) update** below.
+
 ---
 
 ## Update — 2026-06-10 (recurrence on the "good" kernel)
@@ -396,6 +405,136 @@ qm set 109 --usb9 host=25a7:fa61
 qm set 109 --usb13 host=047d:8188
 qm start 109
 # full prior config: /root/vm109-config-backup-20260722-171222.txt
+```
+
+---
+
+## Update — 2026-07-22 (evening): VM 109 won't start after PVE host reboot — `i2c_nvidia_gpu` unbind deadlock (Mode D, fixed)
+
+**A fourth, distinct failure — host-side, not a guest freeze.** Hours after the Mode C
+USB-controller passthrough was applied, the **PVE host was fully rebooted**. On the way
+back up, **VM 109 did not start**, and every manual `qm start 109` failed with:
+
+```
+can't lock file '/var/lock/qemu-server/lock-109.conf' - got timeout
+```
+
+### Mode D — TL;DR
+
+VM 109 has `onboot: 1` (`startup: up=20`), so the host tried to autostart it at boot.
+That boot-time `qm start 109` (PID 3181) **wedged in the kernel in uninterruptible `D`
+state** while handing the GPU to `vfio-pci` — specifically, unbinding the GPU's
+**USB-C/UCSI function `08:00.3`** (`10de:1aed`) from its host driver **`i2c_nvidia_gpu`**.
+The unbind hung inside `i2c_del_adapter` and never returned, so:
+
+- the stuck process **held the VM lock** (`lock-109.conf`) → every subsequent
+  `qm start 109` timed out on the lock;
+- the process was **unkillable** (`kill -9` is a no-op in `D` state) and the GPU's I2C
+  adapter was left half-removed → **only a host reboot could clear it**.
+
+Only VM 109 was affected; the 8 LXCs stayed up throughout.
+
+### Evidence (host `ssh proxmox`, 2026-07-22 evening)
+
+Kernel stack of the wedged PID (`cat /proc/3181/stack`) — the smoking gun:
+
+```
+i2c_del_adapter+0x28d/0x360
+gpu_i2c_remove+0x27/0x40 [i2c_nvidia_gpu]
+pci_device_remove
+device_release_driver_internal
+unbind_store            <- sysfs driver-unbind, stuck
+```
+
+Corroborating `dmesg`: `nvidia-gpu 0000:08:00.3: i2c timeout error e0000000`.
+
+Process state `3181  Ds  …  task …:qmstart:109` — `D` = uninterruptible sleep, survived
+`kill -9`. Driver bindings at the time (`08:00.3` orphaned mid-unbind):
+
+```
+08:00.0 -> vfio-pci
+08:00.1 -> vfio-pci
+08:00.2 -> vfio-pci
+08:00.3 -> (none)      <- half-unbound from i2c_nvidia_gpu, wedged
+```
+
+**Proven / disproven:**
+- **NOT the Mode C USB change itself.** `hostpci2 0000:0c:00.0` enumerated fine at boot;
+  the hang is on the **GPU** function `08:00.3`, a different device. (The Mode C change
+  may have shifted boot probe timing enough to lose the vfio race — see root cause — but
+  the wedge is the GPU i2c unbind.)
+- **NOT a guest problem at all.** The guest never booted; this is a host-side `qm start`
+  deadlock, distinct from the guest display freezes of Modes A/B and the UVC/USB stall of
+  Mode C (no RTD3, no mutter/page-flip, no `videobuf2`).
+
+### Root cause
+
+`vfio.conf` already lists `08:00.3`'s ID (`10de:1aed`) in `options vfio-pci ids=…`, but
+that only wins if `vfio-pci` binds **before** the native driver at boot. The host's
+**`i2c_nvidia_gpu`** module (the GPU's USB-C/UCSI/I2C helper, which pulls in
+`i2c_ccgx_ucsi`) was **not blacklisted**, so it raced in and claimed `08:00.3` on the
+host. When `qm start` then tried to reclaim the function for `vfio-pci`, it had to unbind
+`i2c_nvidia_gpu`, and that unbind intermittently deadlocks in `i2c_del_adapter` (the
+`i2c timeout error e0000000`). This reboot, it deadlocked.
+
+### Fix applied (host `ssh proxmox`)
+
+Blacklist the GPU I2C helper so it never claims `08:00.3` — then `vfio-pci` binds it
+directly at boot and `qm start` has **nothing to unbind** (no hang). Appended to
+`/etc/modprobe.d/vfio.conf` (backup: `/etc/modprobe.d/vfio.conf.bak.20260722`):
+
+```
+# 2026-07-22: prevent host i2c_nvidia_gpu/i2c_ccgx_ucsi from grabbing GPU 08:00.3 (UCSI, 10de:1aed)
+# unbinding it at qm-start wedges in i2c_del_adapter -> hung qmstart holds VM lock. vfio-pci claims it instead.
+blacklist i2c_nvidia_gpu
+blacklist i2c_ccgx_ucsi
+```
+
+Then:
+
+```bash
+sudo update-initramfs -u -k all      # running kernel 7.0.14-4-pve initrd regenerated
+sudo systemctl reboot                # required: the wedged D-state qmstart can't be killed
+```
+
+> ⚠️ **This is NOT `blacklist nvidia`.** This doc's standing lesson (Modes A/B, and the
+> GPU-passthrough ACS/revert plans) is that blanket-blacklisting the **`nvidia`** module
+> causes a host **boot hang** — do not do that. Blacklisting **`i2c_nvidia_gpu`** is a
+> different, safe thing: it's the tiny USB-C/UCSI sideband helper, **not** the
+> render/compute driver, and it does **not** affect the host's **RTX 3060** (used by
+> LXC 107 via the `nvidia` driver) or the 1660 SUPER passthrough.
+
+> ⚠️ The graceful `systemctl reboot` took a few extra minutes — the unkillable `D`-state
+> `qmstart` delayed shutdown before the machine finally reset. It came back on its own; no
+> hard reset was needed, but expect the lag.
+
+### Verification (post-reboot)
+
+```
+lsmod | grep i2c_nvidia_gpu       -> (empty)          i2c helper no longer loaded     OK
+readlink …/0000:08:00.3/driver    -> vfio-pci          claimed cleanly at boot         OK
+systemctl is-active pve-cluster   -> active                                            OK
+qm status 109                     -> status: running   autostarted via onboot=1        OK
+ping 192.168.2.109                -> replies           guest OS up on the network      OK
+ps -eo … | grep qmstart:109       -> none (only kvm)   no wedged task                  OK
+```
+
+### If it ever recurs (recovery when the lock is stuck)
+
+The stuck `qmstart` is unkillable and holds `lock-109.conf`; there is **no reliable
+non-reboot recovery**. Reboot the PVE host (all guests bounce ~1-2 min), then confirm
+`08:00.3 -> vfio-pci` and `i2c_nvidia_gpu` unloaded (as above). If `i2c_nvidia_gpu` is
+somehow loaded again, verify the blacklist made it into the initramfs
+(`lsinitramfs /boot/initrd.img-$(uname -r) | grep -i modprobe`) and re-run
+`update-initramfs -u -k all`.
+
+### Reverting Mode D (not recommended)
+
+```bash
+sudo cp /etc/modprobe.d/vfio.conf.bak.20260722 /etc/modprobe.d/vfio.conf
+sudo update-initramfs -u -k all
+sudo reboot
+# reintroduces the qm-start unbind deadlock on 08:00.3.
 ```
 
 ---
