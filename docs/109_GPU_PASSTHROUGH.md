@@ -10,17 +10,17 @@ Single reference for the GTX 1660 SUPER PCIe passthrough setup on VM 109. Covers
 | ------------------ | ----------------------------------------------------------------------- |
 | GPU                | NVIDIA GeForce GTX 1660 SUPER                                           |
 | VRAM               | 6144 MiB                                                                |
-| Host PCI address   | `08:00.0`                                                               |
+| Host PCI address   | `08:00.0`–`.3` (all functions passed since 2026-07-22: VGA, HDMI audio, USB-C, UCSI) |
 | Guest PCI address  | `01:00.0` (appears as `/dev/dri/card1` — no integrated GPU, no `card0`) |
 | Passthrough method | VFIO PCIe passthrough (`vfio-pci`)                                      |
-| IOMMU group        | 24 (ACS override applied)                                               |
+| IOMMU groups       | 27–30, one per function (ACS override applied; verified 2026-07-22)     |
 
 | Component     | Detail                                                          |
 | ------------- | --------------------------------------------------------------- |
 | VM            | 109                                                             |
 | OS            | Ubuntu 24.04.4 LTS                                              |
-| Kernel        | `6.17.0-29-generic`                                             |
-| NVIDIA driver | `580.142` (open kernel module)                                  |
+| Kernel        | `6.17.0-40-generic`                                             |
+| NVIDIA driver | `595.71.05` (open kernel module; see [Plans/Completed/VM_109_NVIDIA_595_UPGRADE.md](Plans/Completed/VM_109_NVIDIA_595_UPGRADE.md)) |
 | IP            | `192.168.2.20` (SSH alias: `proxmox_main`, user: `proxmox-ml5`) |
 | GDM           | 46.2                                                            |
 | GNOME Shell   | 46.0                                                            |
@@ -72,13 +72,18 @@ The GTX 1660 SUPER is in **IOMMU group 24**. ACS override is active to allow it 
 ### VM config — `/etc/pve/qemu-server/109.conf` (relevant lines)
 
 ```ini
-hostpci0: 0000:08:00.0,pcie=1,x-vga=1
+hostpci0: 0000:08:00,pcie=1,x-vga=1
 machine: q35
 bios: ovmf
 ```
 
+- `0000:08:00` (no function suffix) — passes **all functions** of the card: VGA (`.0`), HDMI/DP audio (`.1`), USB-C controller (`.2`), UCSI (`.3`). Changed from `.0`-only on 2026-07-22 to enable monitor-speaker audio; each function sits in its own IOMMU group so this is clean
 - `pcie=1` — exposes the device as a PCIe device (required for NVIDIA)
 - `x-vga=1` — enables VGA arbitration, required for display output passthrough
+
+Full peripheral map (USB controller `hostpci2`, AMD audio `hostpci1`, per-device USB entries): [109_PERIPHERAL_PASSTHROUGH.md](109_PERIPHERAL_PASSTHROUGH.md).
+
+**Applying `hostpci` changes:** they are *pending* until the QEMU process restarts — use the Proxmox UI Reboot button or `sudo qm reboot 109` on the host. A `reboot` inside the guest does **not** apply them.
 - `machine: q35` — Q35 chipset, required for PCIe passthrough
 - `bios: ovmf` — UEFI firmware (OVMF), required for Q35 + VGA passthrough
 
