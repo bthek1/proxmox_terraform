@@ -13,10 +13,11 @@ Companion docs: [109_GPU_PASSTHROUGH.md](109_GPU_PASSTHROUGH.md) (GPU/display st
 | NVIDIA GTX 1660 SUPER (all functions: VGA + HDMI audio + USB-C + UCSI) | PCI `08:00.0`–`.3` | PCIe passthrough, primary GPU (`x-vga=1`) | `hostpci0: 0000:08:00` | `01:00.x` |
 | AMD HD Audio controller | PCI `10:00.6` | PCIe passthrough | `hostpci1` | `02:00.0` (PipeWire analog-stereo sink) |
 | Kensington 2.4G dongle (kb/mouse) | `047d:8188` | Per-device USB redirection (QEMU emulated) | `usb2` | emulated bus |
-| Logitech MX Brio 4K webcam | `046d:0944` | Per-device USB redirection (QEMU emulated, 480 Mbps cap → **MJPEG only**, 1080p30 OK) | `usb3` | emulated bus |
+| Logitech MX Brio 4K webcam | `046d:0944` | Per-device USB redirection — **MJPEG only**. Physically in the rear USB-C port (C-to-C cable) whose SuperSpeed lanes are deliberately disabled host-side (see Gotchas) so it links USB 2.0 | `usb3` | emulated bus |
 | Card reader (MR-K013) | `25a7:fa61` | Per-device USB redirection (QEMU emulated) | `usb4` | emulated bus |
 | Bluetooth radio (IMC/Realtek) | `13d3:3571` | Per-device USB redirection (QEMU emulated) | `usb1` | emulated bus, `hci0` |
-| UGREEN 2K webcam | `1bcf:2284` | Per-device USB redirection (QEMU emulated, 480 Mbps cap) | `usb5` | emulated bus |
+
+> **UGREEN 2K webcam (`1bcf:2284`)**: unplugged 2026-07-23; its `usb5` entry was removed so the VM can still cold-start (QEMU refuses to boot with a `usb-host` entry whose device is absent). To restore when replugged: `sudo qm set 109 -usb5 host=1bcf:2284`.
 
 ## Stays on the Proxmox host
 
@@ -41,7 +42,12 @@ Companion docs: [109_GPU_PASSTHROUGH.md](109_GPU_PASSTHROUGH.md) (GPU/display st
 
 - **`hostpci`/`usb` config changes need a QEMU restart, not a guest reboot.** Use the Proxmox UI *Reboot* button or `sudo qm reboot 109` on the host. A `reboot` from inside the guest restarts the OS but not the QEMU process, so pending changes do not apply.
 - **QEMU refuses to start if a `usb-host` entry's device is unplugged.** Keep entries only for permanently attached devices; hot-plug anything else via the web UI.
-- **Both cams are capped at USB 2.0** by emulated redirection — use MJPEG. Fine for UGREEN 2K and Brio 1080p30.
+- **QEMU forwards a device at whatever speed the HOST negotiated — and cannot downgrade it.** Verified 2026-07-23: removing/adding the `usb3=1` flag does not change the attachment; a host-SS device always attaches SS in the guest. And **QEMU's emulated xHCI (even QEMU 11.0 / PVE 9.2.3) cannot carry a SuperSpeed UVC isochronous stream**: at SS attachment, 1080p and even 640×480 MJPEG deliver 0 frames with `not part of TD` floods; 320×240 delivers frames but still logs ring errors (matches the earlier green-frames observation). The `uvcvideo` `FIX_BANDWIDTH` quirk (128) does not help. There is no config-level fix — SS through the forward is a dead end.
+- **Workaround in place — rear USB-C port is forced to USB 2.0:** host udev rule `/etc/udev/rules.d/90-usbc-port-force-usb2.rules` writes `disable=1` to the chipset 20G root hub's port 1 (`usb2-port1`), so the Brio's C-to-C connection falls back to a 480M link, where 1080p30 MJPEG is verified clean (29.3 fps sustained, 0 errors). Manual re-apply: `echo 1 > /sys/bus/usb/devices/usb2/2-0:1.0/usb2-port1/disable`.
+- **UVC probe stalls (`-32`/`-110`, EIO on open) after an attach**: re-running `qm set 109 -usb3 host=046d:0944` (live re-attach) clears it. Also seen: one physical port (host 1-3) had degraded iso bandwidth (~19 fps at 1080p) — moving ports fixed it.
+- **Planned native-SS path (cable on order, ETA 2026-07-24):** CPU controllers `10:00.3`/`10:00.4` (Raphael xHCI) are each alone in their IOMMU group (40/41) with working `pm` reset — ideal whole-controller passthrough candidates, unlike the chipset. Their rear sockets linked the Brio only at 480M with a USB2-only C-to-A cable; retest with a proper USB3 cable, and if SS comes up, pass `10:00.4` as `hostpci2` (card reader rides along), delete the `usb3`/`usb4` forwards, `qm reboot` — restores 4K/YUYV/clean-mic-at-1080p.
+- **UGREEN cam is a native USB2 device** — 480M is its ceiling; MJPEG 2K fine.
+- **Brio mic crackles while 1080p video streams** (verified 2026-07-23): 1080p30 MJPEG saturates the 480M iso pipe and audio packets corrupt (near-full-scale clicks). Clean with 720p video or audio-only. The Brio is the ONLY USB mic in the guest (UGREEN is unplugged; when it was forwarded it exposed no capture device here — do not plan around its mic). Alternatives for 1080p-video-plus-mic: ALC897 analog jack (`hostpci1` audio) or a BT headset — or drop to 720p when the Brio mic is needed (video-call apps use ≤720p anyway). A SuperSpeed link is NOT a fix — see above, green frames.
 
 ---
 
