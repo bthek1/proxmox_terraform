@@ -645,6 +645,59 @@ Key findings:
 
 ---
 
+## Update — 2026-07-24 (Mode E: CPU xHCI `10:00.4` passthrough → instant HOST hard-reset + boot crash-loop — reverted, DO NOT RETRY)
+
+**The worst failure mode yet — host-fatal, not guest-fatal.** The "planned native-SS
+path" from the peripheral map (pass CPU controller `10:00.4` as `hostpci2` once a proper
+USB3 cable arrived) was executed and **hard-reset the entire Proxmox host the instant VM
+109 (re)started** — no panic, no PCIe error, no log line; the machine just power-cycled.
+
+### Timeline (all 2026-07-24)
+
+| Time | Event |
+|---|---|
+| 18:35:00 | `qm set 109 -hostpci2 0000:10:00.4,pcie=1` (AMD Raphael xHCI, IOMMU group 41) |
+| 18:35:08 | `qm set 109 --delete usb3` (Brio forward removed per the plan) |
+| 18:35:23 | `qm reboot 109` → pending hostpci applied on QEMU restart → **host hard reset** |
+| 18:36–18:52 | **Boot crash-loop ×7**: each boot, `startall` reached VM 109 (`onboot` was set) ~60 s in → host reset again |
+| 18:52–18:56 | Loop broken: `startall` killed before reaching 109; `onboot` removed via GUI |
+| 18:58 | Reverted: `qm set 109 --delete hostpci2`, `qm set 109 --usb3 host=046d:0944` — host stable |
+
+### Root cause
+
+`10:00.4` (with `10:00.3`) is an **AMD Raphael/Granite Ridge CPU-integrated xHCI** — one
+function of the CPU root-complex device `10:00.x` (iGPU `.0`, PSP `.2`, xHCIs `.3`/`.4`,
+audio `.6`). It *looks* like an ideal passthrough candidate (alone in its IOMMU group,
+advertises a `pm` reset method), but **the advertised reset is broken in hardware**:
+vfio's detach/reset at VM start takes down the whole platform. Contrast the ASMedia
+chipset controller `0c:00.0` (Mode C), which passed through *survivably* and only failed
+at the device level. An advertised reset method ≠ a working one.
+
+Note the working `hostpci1` = `10:00.6` (audio) is a function of this same complex — audio
+passthrough is fine; it's the **xHCI functions whose reset is host-fatal**.
+
+### Diagnosis gotcha — the journal lies about crash-loop triggers
+
+On a hard reset the last seconds of the journal are **lost before flush**. Every
+crash-loop boot's journal *appeared* to end at "starting CT 200/201" (plus a red-herring
+ext4 MMP wait), but the real last act — `Starting VM 109` — only survived to disk in one
+boot. **When a PVE host crash-loops during `startall`, suspect a guest 1–2 positions
+*after* the last one logged.** Breaking the loop = kill `startall` (or `qm set <id>
+--onboot 0`) via SSH in the ~60 s window before autostart reaches the trigger guest.
+
+### Verdict / do-not-repeat
+
+- **Never pass `10:00.3` or `10:00.4` (`1022:15b6`/`1022:15b7`) to any guest.** Host
+  hard-resets on VM start; with `onboot` set this becomes an unattended crash-loop.
+- The only untested variant (boot-time vfio binding via `vfio.conf` ids to skip the
+  runtime unbind) still performs the same reset at VM start — considered closed. If ever
+  revisited despite this: `onboot` off first, all guests down, console access ready.
+- The native-SuperSpeed path for the Brio is now **fully exhausted** (chipset controller:
+  Mode C reset-loops; CPU controllers: host-fatal). `1080p30 MJPEG, USB 2.0, redirected`
+  stands as the permanent answer.
+
+---
+
 ## Environment & topology
 
 | Item | Detail |
