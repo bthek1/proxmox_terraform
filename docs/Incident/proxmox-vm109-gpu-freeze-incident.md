@@ -600,6 +600,49 @@ usb5: host=1bcf:2284                     # UGREEN cam
 > entries, **VM 109 will refuse to start if any of them is unplugged** — replug or
 > `qm set 109 --delete usbN` first.
 
+### Brio resolution ceiling — DEFINITIVE: `1920×1080 @ 30 fps` MJPEG over USB 2.0 redirection (2026-07-22/23)
+
+**The stable, accepted config is `1920×1080 @ 30 fps`, Motion-JPEG, via per-device USB
+redirection (`usb3`) with the Brio on a USB 2.0 (480 Mbps) port.** Higher resolutions
+green-screen. Three transport options were tried end-to-end; **only this one is stable:**
+
+| Transport | Brio link | Result |
+|---|---|---|
+| **USB 2.0 + redirection** ✅ | 480 Mbps | **Stable to 1080p30 MJPEG** — accepted setup |
+| USB 3.0 + redirection ❌ | 5 Gbps | **Worse** — only 352×288; green above (see below) |
+| USB 3.0 + **controller passthrough** ❌ | 5 Gbps | **Worse** — Brio reset-loops, never streams |
+
+Key findings:
+
+- **MJPEG is mandatory** — uncompressed YUYV won't fit; MJPEG is ~10× lighter and is what
+  lets 1080p30 through. The camera is **not** at fault — it does 4K natively on a laptop.
+- **Counter-intuitive: USB 3.0 made it worse, not better.** On the USB-C/SuperSpeed port,
+  redirection dropped to only **352×288** (a partial frame at 640×360, green above). USB
+  3.0 uses **burst isochronous** transfers that QEMU's emulated USB path mishandles; USB
+  2.0 high-speed isochronous is simpler and usbredir carries it far better. So for a
+  redirected UVC camera, **USB 2.0 is the *better* connection**, not a compromise.
+- **Controller passthrough was tried and FAILED (reverted).** `hostpci2 0000:0c:00.0`
+  (Brio alone on it, SuperSpeed) → inside the guest the Brio **reset-looped**:
+  ```
+  uvcvideo 12-1:1.1: Failed to set UVC probe control : -110   (timeout)
+  usb 12-1: reset SuperSpeed USB device number 2 … 3 … 4 … 5 … 6 … 7 … 8   (re-enumerating every few s)
+  xhci_hcd 0000:03:00.0: Event … not part of TD                (ASMedia event-ring glitch)
+  ```
+  The passed-through **ASMedia `1022:43f7` controller does not deliver a stable SuperSpeed
+  isochronous stream under VFIO** (the `not part of TD` spam noted in Mode C, now biting)
+  — likely compounded by power draw at high res. Reverted with:
+  ```bash
+  qm stop 109; qm set 109 --delete hostpci2; qm set 109 --usb3 host=046d:0944; qm start 109
+  # then return the controller to the host so redirection can see the Brio:
+  echo 0000:0c:00.0 | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind
+  echo 0000:0c:00.0 | sudo tee /sys/bus/pci/drivers_probe
+  # and physically move the Brio back to a USB 2.0 (black USB-A) port.
+  ```
+- **Verdict / do-not-repeat:** don't chase >1080p for the Brio on this box. USB 3.0 is
+  worse under redirection, and controller passthrough reset-loops. `1080p30 MJPEG on a USB
+  2.0 port` is the answer. Only remaining unexplored lever = a **powered hub / different
+  SuperSpeed cable** to rule out power before ever revisiting passthrough.
+
 ---
 
 ## Environment & topology
