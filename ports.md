@@ -17,7 +17,8 @@ Front-panel / internal (AURA LED, Bluetooth — bus 5) hang off `0e:00.0` — ne
 | Socket | Device | Host port | Speed | Status |
 |---|---|---|---|---|
 | dark blue #1 (`0c:00.0`, USB2-only) | Mouse (Compx 2.4G receiver) | 3-5 | 12M | OK, forwarded (`usb4`) |
-| dark blue #2/#3 (`10:00.4`, USB2 side) | **Logitech C922** (`046d:085c`, replaced refunded Brio) + **UGREEN 2K** (`1bcf:2284`) | 9-2, 9-x | 480M | C922 → VM 109 (`usb3` forward, verified; mic clean under 1080p load). UGREEN → **LXC 205** (host-owned, `/dev/video0`/`video1` passed as `dev5`/`dev6`) |
+| chipset ports (`0c:00.0`, bus 3) | **Brio 500** (`046d:0943`, port 3-1, USB-C→A) — sole VM 109 camera | 3-1 | 480M | → VM 109 (`usb5` forward; verified: 30fps 1080p even dim, mic clean under load). C922 removed & unplugged 2026-07-25 (spare) |
+| `10:00.4` USB2 side | **UGREEN 2K** (`1bcf:2284`) | 9-1 | 480M | → **LXC 205** (host-owned; video+mic nodes passed as `dev5`–`dev9`) |
 | dark blue #4 (`10:00.3`) | Keyboard (Kensington dongle) | 7-2 | 12M | OK, forwarded (`usb2`) |
 
 # Outcome of the native-SS plan — ⛔ DO NOT RETRY
