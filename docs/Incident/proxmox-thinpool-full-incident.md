@@ -132,29 +132,39 @@ filled. Reported as "Firefox isn't opening and internet isn't working":
 
 ---
 
-## Prevention (state as of 2026-08-03)
+## Prevention (updated 2026-08-04)
 
-Current pool level after recovery: **~91.6%** — functional but still close to the edge.
+> **RESOLVED — capacity fixed by migrating everything to a new 4 TB SSD.** A Seagate
+> FireCuda 530 4 TB NVMe was added and set up as LVM-thin storage **`nvme4tb-lvm`**, then
+> **all 12 guests were moved off `pve/data`** onto it (CTs via offline `pct move-volume`,
+> VMs 109/204 via online `qm disk move`). `pve/data` dropped **92% → ~0%** — the old boot
+> pool is now empty of guests and the fill risk that caused this outage is retired. The
+> **same trim gotcha now applies to `nvme4tb-lvm`** (nothing trims automatically), so the
+> watch/periodic-trim items below still stand — just against the new pool. See
+> [PROXMOX_INVENTORY.md](../PROXMOX_INVENTORY.md) "Storage migration" note.
 
-- [ ] **Periodic trim (the actual fix):** weekly timer running `pct fstrim <id>` for all
-  running CTs + `qm guest cmd 109 fstrim` (agent must be up; `scsi0` already has
-  `discard=on`). This incident cannot recur if trims run.
-- [ ] Delete stale snapshots still holding space: `snap_vm-100-disk-0_new`,
-  `snap_vm-100-disk-0_test_snap`.
+- [ ] **Periodic trim (still the actual fix):** weekly timer running `pct fstrim <id>` for
+  all running CTs + `qm guest exec 109 -- fstrim -av` (agent must be up; `scsi0` already
+  has `discard=on`). Not yet installed. This incident cannot recur if trims run.
+- [x] **Delete stale snapshots** `snap_vm-100-disk-0_new` / `snap_vm-100-disk-0_test_snap`
+  — done 2026-08-04 (`pct delsnapshot`), which also unblocked CT 100's migration.
 - [ ] Offline `pct fsck` for the CTs that recorded ext4 error counts during the EIO
   window (at least 100, 103 + two others — kernel logged "error count since last fsck"
   on dm-6/10/14/16). They run fine; the counts persist until fsck'd.
-- [ ] Capacity: consider shrinking/relocating the big consumers (VM 109 ~180 G
-  allocated, CT 205's 300 G volume, CT 111 gh-runner at ~98% of its 64 G — CI artifact
-  growth) or moving bulk data to the 2 TB disk (`/mnt/pve/backup-2tb`).
-- **Watch:** `lvs pve/data` — treat Data% ≥ 95% as an outage already in progress. The
-  `D` in attr `twi-aotzD-` means it has happened.
+- [x] **Capacity: relocated the big consumers** — all guests migrated to the 4 TB
+  `nvme4tb-lvm` on 2026-08-04, `pve/data` now ~0%. Caveat: VM 109/204 disks moved *online*
+  are thick (Data% 100%) on the new pool; in-guest fstrim won't re-thin them — offline
+  `qm disk move` round-trip if the ~85 G is ever wanted (harmless at 22% pool use).
+- **Watch:** `lvs nvme4tb/data` (guests live here now; also `lvs pve/data` for the old
+  pool) — treat Data% ≥ 95% as an outage already in progress. The `D` in attr `twi-aotzD-`
+  means it has happened.
 
 ## Quick diagnostic reference
 
 ```bash
 # pool state (the number that matters):
-ssh proxmox sudo lvs pve/data          # Data% + attr; 'D' flag = out of space
+ssh proxmox sudo lvs nvme4tb/data      # guests live here since 2026-08-04; Data% + attr, 'D' flag = out of space
+ssh proxmox sudo lvs pve/data          # old boot pool (now ~empty of guests)
 
 # who's holding the space (inactive volumes hide their Data%):
 sudo lvs -a --units g -o lv_name,lv_size,data_percent,pool_lv,origin --sort -data_percent
